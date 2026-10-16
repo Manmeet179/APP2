@@ -1465,20 +1465,20 @@ def init_db_cached():
 
 
 NAV_LABELS = {
-    'Home':'Rachna Hub',
-    'Gallery':'Collections',
-    'Order':'New Order',
-    'Account':'My Space',
-    'Order History':'Order History',
-    'Order Details':'Order History',
-    'Emails':'Communications',
-    'About':'About Rachna',
-    'Contact Us':'Get In Touch',
-    'Master Gallery':'Rachna Collections',
-    'Master Account':'Account Center',
-    'Admin Master':'Admin Console',
+    'Home':'Home',
+    'Gallery':'Products',
+    'Your Bag':'My Bag',
+    'Order':'Checkout',
     'Track Order':'Track Order',
-    'Your Bag':'Your Bag',
+    'Order History':'My Orders',
+    'Account':'My Account',
+    'About':'About Us',
+    'Contact Us':'Contact Us',
+    'Order Details':'Order Management',
+    'Emails':'Email Center',
+    'Master Gallery':'Product Management',
+    'Master Account':'Staff Management',
+    'Admin Master':'System Settings',
     'Login':'Login',
 }
 
@@ -1515,19 +1515,45 @@ def main():
         if logo and image_row_source(logo): st.image(image_row_source(logo),use_container_width=True)
         st.markdown('<div style="text-align:center;color:#d6ae52;font-weight:800">RACHNA PLAYWOOD & HARDWARE</div>',unsafe_allow_html=True)
         st.divider()
+
+        # Two-level sidebar navigation:
+        # 1) User navigation is always first for admins as well.
+        # 2) Admin-only navigation appears below it and is never shown to normal users.
+        user_nav=['Home','Gallery','Your Bag','Order','Track Order','Order History','Account','About','Contact Us']
+        admin_nav=['Order Details','Emails','Master Gallery','Master Account','Admin Master']
+
         if st.session_state.admin:
-            nav=['Home','Gallery','Order','Your Bag','Track Order','Account','Order Details','Emails','About','Contact Us','Master Gallery','Master Account','Admin Master']
+            st.markdown('### 👤 User Navigation')
+            nav=user_nav
+            for p in nav:
+                label=nav_label(p)
+                if st.button(label,key='nav_'+p,use_container_width=True,type='primary' if st.session_state.page==p else 'secondary'):
+                    st.session_state.page=p
+                    st.session_state._consumed_page_qp=p
+                    st.rerun()
+
+            st.divider()
+            st.markdown('### 🔐 Admin Navigation')
+            for p in admin_nav:
+                label=nav_label(p)
+                if st.button(label,key='nav_admin_'+p,use_container_width=True,type='primary' if st.session_state.page==p else 'secondary'):
+                    st.session_state.page=p
+                    st.session_state._consumed_page_qp=p
+                    st.rerun()
+
         elif st.session_state.user_id:
-            nav=['Home','Gallery','Order','Your Bag','Track Order','Order History','Account','About','Contact Us']
+            visible=public_page_names()
+            nav=[x for x in user_nav if x in visible or x in ('Track Order','Order History')]
+            for p in nav:
+                label=nav_label(p)
+                if st.button(label,key='nav_'+p,use_container_width=True,type='primary' if st.session_state.page==p else 'secondary'):
+                    st.session_state.page=p
+                    st.session_state._consumed_page_qp=p
+                    st.rerun()
         else:
-            nav=['Login']
-        if st.session_state.user_id and not st.session_state.admin:
-            visible=public_page_names(); nav=[x for x in nav if x in visible or x in ('Login','Track Order','Order History')]
-        for p in nav:
-            label=nav_label(p)
-            if st.button(label,key='nav_'+p,use_container_width=True,type='primary' if st.session_state.page==p else 'secondary'):
-                st.session_state.page=p
-                st.session_state._consumed_page_qp=p
+            if st.button('Login',key='nav_Login',use_container_width=True,type='primary' if st.session_state.page=='Login' else 'secondary'):
+                st.session_state.page='Login'
+                st.session_state._consumed_page_qp='Login'
                 st.rerun()
         st.divider()
         if st.session_state.admin or st.session_state.user_id:
