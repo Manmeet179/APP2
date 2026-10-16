@@ -55,15 +55,16 @@ button[kind="headerNoPadding"]{visibility:visible!important}
 .profile-card{border:1px solid #d6ae52;border-radius:22px;padding:20px;background:#071b33dd;text-align:center}
 .dp{width:92px;height:92px;border-radius:50%;object-fit:cover;border:3px solid #d6ae52;margin:auto;display:block}
 .att-row{border-radius:12px;padding:8px 12px;margin:5px 0;border:1px solid #ffffff22}
-.marquee-wrap{overflow:hidden;display:flex;flex-direction:column;gap:9px;margin:1rem 0}
-.marquee-row{overflow:hidden;white-space:nowrap;display:flex}
-.marquee-track{display:flex;gap:10px;width:max-content;animation:move-left 30s linear infinite}
+.marquee-wrap{overflow:hidden;display:flex;flex-direction:column;gap:10px;margin:1rem 0;width:100%}
+.marquee-row{overflow:hidden;white-space:nowrap;display:flex;width:100%}
+.marquee-track{display:flex;align-items:center;gap:10px;width:max-content;animation:move-left 30s linear infinite;will-change:transform}
 .marquee-row.right .marquee-track{animation-name:move-right}
-.marquee-track img{height:52px;width:84px;object-fit:contain;background:#fff;border-radius:9px;padding:4px}
+.marquee-logo-box{width:84px!important;height:52px!important;min-width:84px!important;max-width:84px!important;flex:0 0 84px!important;box-sizing:border-box!important;display:flex!important;align-items:center!important;justify-content:center!important;background:#fff;border-radius:9px;padding:4px;overflow:hidden}
+.marquee-logo-box img{width:100%!important;height:100%!important;max-width:100%!important;max-height:100%!important;display:block!important;object-fit:contain!important;object-position:center!important}
 @keyframes move-left{from{transform:translateX(-50%)}to{transform:translateX(0)}}
 @keyframes move-right{from{transform:translateX(0)}to{transform:translateX(-50%)}}
 @media(max-width:1100px){.product-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:720px){.block-container{padding-top:4rem!important}.product-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.product-mini{padding:6px}.product-mini img{height:var(--product-h-mobile,125px)}.marquee-track img{height:40px;width:66px}header[data-testid="stHeader"] button[data-testid="stSidebarCollapseButton"],header[data-testid="stHeader"] button[data-testid="stSidebarExpandButton"]{width:42px!important;height:40px!important}}
+@media(max-width:720px){.block-container{padding-top:4rem!important}.product-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.product-mini{padding:6px}.product-mini img{height:var(--product-h-mobile,125px)}.marquee-logo-box{width:72px!important;height:44px!important;min-width:72px!important;max-width:72px!important;flex-basis:72px!important;padding:3px}header[data-testid="stHeader"] button[data-testid="stSidebarCollapseButton"],header[data-testid="stHeader"] button[data-testid="stSidebarExpandButton"]{width:42px!important;height:40px!important}}
 @media(max-width:430px){.product-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.product-mini .name{font-size:.82rem}.product-mini .price{font-size:.78rem}}
 .stButton>button{border-radius:10px;border:1px solid #d6ae52;font-weight:600}
 div.stButton>button[kind="primary"]{background:#071b33;color:white}
@@ -167,12 +168,45 @@ def init_db():
     """CREATE INDEX IF NOT EXISTS idx_rachna_email_log_created ON rachna_email_log(created_at DESC)""",
     """CREATE INDEX IF NOT EXISTS idx_rachna_orders_date ON rachna_orders(created_at DESC)""",
     "INSERT INTO rachna_page_config(page_name,visible) VALUES ('Home',TRUE),('Gallery',TRUE),('Order',TRUE),('Account',TRUE),('About',TRUE),('Contact Us',TRUE) ON CONFLICT(page_name) DO NOTHING""" ]
-    conn=db_connect()
-    try:
-        with conn:
+    # Run schema statements independently so one non-critical migration cannot
+    # roll back later migrations (important for existing installations).
+    for sql in sqls:
+        conn = db_connect()
+        try:
             with conn.cursor() as cur:
-                for sql in sqls: cur.execute(sql)
-    finally: conn.close()
+                cur.execute(sql)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            # Keep startup alive; critical tables/columns are re-checked below.
+        finally:
+            conn.close()
+
+    # Mandatory user-auth migration: run separately and commit each statement.
+    user_migrations = [
+        "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_hash TEXT",
+        "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ",
+        "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    ]
+    for sql in user_migrations:
+        conn = db_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Existing password/PIN users are trusted as already-verified accounts.
+    conn = db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE rachna_users SET email_verified=TRUE WHERE email_verified=FALSE AND COALESCE(password_hash,'') <> ''")
+        conn.commit()
+    finally:
+        conn.close()
 
 def money(v):
     return "Price on request" if v is None else "₹{:,.2f}".format(float(v))
@@ -533,9 +567,22 @@ def release_upload_lock(lock_key):
     st.session_state[lock_key] = False
 
 
+def ensure_email_log_table():
+    # Safety net for existing deployments where the startup migration was not run.
+    query("""CREATE TABLE IF NOT EXISTS rachna_email_log(
+        id BIGSERIAL PRIMARY KEY,
+        sender_email TEXT, sender_name TEXT, recipient_email TEXT NOT NULL, cc_email TEXT,
+        subject TEXT NOT NULL, text_body TEXT, html_body TEXT,
+        email_type TEXT NOT NULL DEFAULT 'Manual', related_order_id BIGINT REFERENCES rachna_orders(id) ON DELETE SET NULL,
+        status TEXT NOT NULL DEFAULT 'Sent', error_message TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""", fetch=False)
+    query("CREATE INDEX IF NOT EXISTS idx_rachna_email_log_created ON rachna_email_log(created_at DESC)", fetch=False)
+
+
 def emails_page():
     if not st.session_state.get('admin'):
         st.error('Admin login required.'); return
+    ensure_email_log_table()
     page_header('EMAIL CENTER','Emails','Send Rachna-branded emails and view emails sent from this app')
     tab_send, tab_inbox = st.tabs(['✉ Send Mail','📥 Mailbox'])
     with tab_send:
@@ -1342,7 +1389,7 @@ def main():
         if rows:
             per_row=5; nrows=max(1,(len(rows)+per_row-1)//per_row); markup='<div class="marquee-wrap">'
             for i in range(nrows):
-                group=rows[i*per_row:(i+1)*per_row] or rows; imgs=''.join(f"<img src='{image_src_for_html(r)}' alt='Rachna logo'>" for r in group); track=imgs*2; direction='right' if i%2 else 'left'; markup+=f"<div class='marquee-row {direction}'><div class='marquee-track'>{track}</div></div>"
+                group=rows[i*per_row:(i+1)*per_row] or rows; imgs=''.join(f"<div class='marquee-logo-box'><img src='{image_src_for_html(r)}' alt='Rachna logo'></div>" for r in group); track=imgs*2; direction='right' if i%2 else 'left'; markup+=f"<div class='marquee-row {direction}'><div class='marquee-track'>{track}</div></div>"
             st.markdown(markup+'</div>',unsafe_allow_html=True)
         a,b,c=st.columns(3); a.markdown('### 🪵 Furniture\nMade-to-order furniture.'); b.markdown('### 🧰 Hardware\nFittings and hardware products.'); c.markdown('### 📐 Materials\nPlywood, sizes and colours.')
     elif p=='Contact Us':
