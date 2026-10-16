@@ -208,6 +208,23 @@ def init_db():
     finally:
         conn.close()
 
+def ensure_auth_schema():
+    """Repair auth columns on every app start, even when Streamlit cache is warm."""
+    conn = db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_hash TEXT")
+            cur.execute("ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_attempts INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 def money(v):
     return "Price on request" if v is None else "₹{:,.2f}".format(float(v))
 
@@ -1010,6 +1027,8 @@ def login_page():
                         pending["otp_attempts"]=int(pending.get("otp_attempts",0))+1; st.session_state.registration_pending=pending; st.error("Incorrect OTP.")
                     else:
                         try:
+                            # Final safety net: guarantee the auth migration before INSERT.
+                            ensure_auth_schema()
                             row=query("INSERT INTO rachna_users(name,phone,email,password_hash,email_verified,updated_at) VALUES(%s,%s,%s,%s,TRUE,NOW()) RETURNING id",(pending["name"],pending["phone"],pending["email"],""))[0]
                             st.session_state.pop("registration_pending",None); st.session_state.pin_setup_user_id=int(row["id"]); st.success("Email verified and account created. Set your 4-digit PIN below."); st.rerun()
                         except Exception as e: st.error(f"Could not create account: {e}")
@@ -1313,7 +1332,11 @@ def init_db_cached():
 
 
 def main():
-    try: init_db_cached()
+    try:
+        init_db_cached()
+        # Do this outside the cached initializer too: Streamlit can keep the
+        # old init_db result after a code/data migration.
+        ensure_auth_schema()
     except Exception as e:
         st.error('PostgreSQL connection or table setup failed.'); st.code(str(e)); st.stop()
     if 'admin' not in st.session_state: st.session_state.admin=False
