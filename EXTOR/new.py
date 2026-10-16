@@ -152,8 +152,19 @@ def init_db():
     """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ""",
     """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_attempts INTEGER NOT NULL DEFAULT 0""",
     """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE""",
+    """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_hash TEXT""",
+    """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ""",
+    """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_attempts INTEGER NOT NULL DEFAULT 0""",
     """UPDATE rachna_users SET email_verified=TRUE WHERE email_verified=FALSE AND COALESCE(password_hash,'') <> ''""",
     """CREATE INDEX IF NOT EXISTS idx_rachna_users_email ON rachna_users(email)""",
+    """CREATE TABLE IF NOT EXISTS rachna_email_log(
+        id BIGSERIAL PRIMARY KEY,
+        sender_email TEXT, sender_name TEXT, recipient_email TEXT NOT NULL, cc_email TEXT,
+        subject TEXT NOT NULL, text_body TEXT, html_body TEXT,
+        email_type TEXT NOT NULL DEFAULT 'Manual', related_order_id BIGINT REFERENCES rachna_orders(id) ON DELETE SET NULL,
+        status TEXT NOT NULL DEFAULT 'Sent', error_message TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_rachna_email_log_created ON rachna_email_log(created_at DESC)""",
     """CREATE INDEX IF NOT EXISTS idx_rachna_orders_date ON rachna_orders(created_at DESC)""",
     "INSERT INTO rachna_page_config(page_name,visible) VALUES ('Home',TRUE),('Gallery',TRUE),('Order',TRUE),('Account',TRUE),('About',TRUE),('Contact Us',TRUE) ON CONFLICT(page_name) DO NOTHING""" ]
     conn=db_connect()
@@ -172,46 +183,99 @@ def password_hash(value):
 def make_otp():
     return f"{secrets.randbelow(900000) + 100000:06d}"
 
-def send_registration_otp(email, name, otp):
-    host = cfg("SMTP_HOST", "smtp.gmail.com")
-    port = int(cfg("SMTP_PORT", "587"))
-    user = cfg("SMTP_USER") or cfg("SMTP_USERNAME") or cfg("SMTP_EMAIL")
-    pw = cfg("SMTP_PASSWORD")
-    from_name = cfg("SMTP_FROM_NAME", APP_NAME)
-    if not user or not pw:
-        return False, "SMTP_USER/SMTP_PASSWORD are not configured."
-    msg = EmailMessage()
-    msg["Subject"] = f"{APP_NAME} — Email Verification OTP"
-    msg["From"] = f"{from_name} <{user}>"
-    msg["To"] = email
-    text = (f"Hello {name},\n\nYour Rachna registration verification code is: {otp}\n\n"
-            "This OTP is valid for 5 minutes and can be used only once.\n"
-            "If you did not request this, you can ignore this email.\n\n"
-            f"{APP_NAME}")
-    html_body = f"""<div style="font-family:Arial,sans-serif;background:#f3f0e8;padding:24px">
-      <div style="max-width:560px;margin:auto;background:#071b33;border-radius:18px;overflow:hidden;border:1px solid #d6ae52">
-        <div style="padding:28px;text-align:center">
-          <div style="color:#d6ae52;font-size:13px;letter-spacing:2px;font-weight:700">{html.escape(APP_NAME)}</div>
-          <h2 style="color:white;margin:14px 0 8px">Verify your email</h2>
-          <p style="color:#dbe4ef">Hello {html.escape(name)}, use this 6-digit OTP to complete registration.</p>
-          <div style="display:inline-block;background:white;color:#071b33;font-size:32px;font-weight:800;letter-spacing:9px;padding:16px 22px;border-radius:14px;margin:14px 0">{otp}</div>
-          <p style="color:#b8c4d2;font-size:13px">Valid for 5 minutes · One-time use</p>
-        </div>
-      </div>
-    </div>"""
-    msg.set_content(text)
-    msg.add_alternative(html_body, subtype="html")
+def email_brand_name():
+    return str(cfg("EMAIL_BRAND_NAME", "RACHNA PLYWOOD & HARDWEAR VADGAM")).strip() or "RACHNA PLYWOOD & HARDWEAR VADGAM"
+
+def get_email_logo():
+    logo_url=""; logo_bytes=None; logo_mime="image/jpeg"
     try:
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=15) as smtp:
-                smtp.login(user, pw); smtp.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=15) as smtp:
-                smtp.ehlo(); smtp.starttls(context=ssl.create_default_context()); smtp.ehlo()
-                smtp.login(user, pw); smtp.send_message(msg)
-        return True, "OTP email sent."
+        logo=get_setting("app_logo")
+        if logo:
+            logo_url=str(logo.get("image_url") or "").strip()
+            logo_bytes=logo.get("image_data") or None
+            logo_mime=str(logo.get("mime_type") or "image/jpeg")
+            if logo_url and not logo_bytes:
+                try:
+                    lr=requests.get(logo_url,timeout=8)
+                    if lr.ok:
+                        logo_bytes=lr.content
+                        logo_mime=lr.headers.get("Content-Type","image/jpeg").split(";")[0]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    logo_html=(f'<img src="cid:rachna_logo" alt="Rachna" style="max-height:76px;max-width:240px;display:block;margin:0 auto 12px;object-fit:contain;">' if logo_bytes else (f'<img src="{html.escape(logo_url, quote=True)}" alt="Rachna" style="max-height:76px;max-width:240px;display:block;margin:0 auto 12px;object-fit:contain;">' if logo_url else ""))
+    return logo_html,logo_bytes,logo_mime
+
+def email_shell(body_html, logo_html, title, subtitle=""):
+    brand=html.escape(email_brand_name())
+    title_e=html.escape(title)
+    sub_html=f'<div style="color:#cbd5e1;font-size:13px;margin-top:6px;">{html.escape(subtitle)}</div>' if subtitle else ""
+    return (f'<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;">'
+            f'<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center">'
+            f'<table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;">'
+            f'<tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}'
+            f'<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:800;">{brand}</div>'
+            f'<div style="color:#fff;font-size:24px;font-weight:800;margin-top:8px;">{title_e}</div>{sub_html}</td></tr>'
+            f'<tr><td style="padding:26px 24px;">{body_html}</td></tr>'
+            f'<tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;">'
+            f'<b style="color:#d6ae52;">{brand}</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>')
+
+def log_email_message(recipient, cc, subject, text_body, html_body, email_type="Manual", related_order_id=None, status="Sent", error_message=None, sender_email=None, sender_name=None):
+    try:
+        query("""INSERT INTO rachna_email_log(sender_email,sender_name,recipient_email,cc_email,subject,text_body,html_body,email_type,related_order_id,status,error_message,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())""",
+              (sender_email or str(cfg("SMTP_USER") or cfg("SMTP_USERNAME") or cfg("SMTP_EMAIL") or ""),sender_name or email_brand_name(),recipient,cc,subject,text_body,html_body,email_type,related_order_id,status,error_message),fetch=False)
     except Exception as e:
-        return False, f"OTP email failed: {type(e).__name__}: {e}"
+        print(f"[RACHNA EMAIL LOG] {type(e).__name__}: {e}",flush=True)
+
+def send_generic_email(to_email, subject, details, email_type="Admin Manual"):
+    host=cfg("SMTP_HOST","smtp.gmail.com"); port=int(cfg("SMTP_PORT","587")); user=cfg("SMTP_USER") or cfg("SMTP_USERNAME") or cfg("SMTP_EMAIL"); pw=cfg("SMTP_PASSWORD"); from_name=str(cfg("SMTP_FROM_NAME") or email_brand_name()).strip()
+    recipient=str(to_email or "").strip().lower(); subject=str(subject or "").strip(); details=str(details or "").strip()
+    if not recipient or "@" not in recipient: return False,"Enter a valid recipient email."
+    if not subject: return False,"Subject is required."
+    if not details: return False,"Details are required."
+    if not user or not pw: return False,"SMTP_USER/SMTP_PASSWORD are not configured."
+    logo_html,logo_bytes,logo_mime=get_email_logo()
+    body=f'<div style="white-space:pre-wrap;font-size:15px;line-height:1.7;color:#27364b;">{html.escape(details)}</div>'
+    html_body=email_shell(body,logo_html,subject,email_type.upper())
+    text_body=f"{email_brand_name()}\n\n{details}"
+    msg=EmailMessage(); msg["Subject"]=subject; msg["From"]=f"{from_name} <{user}>"; msg["To"]=recipient; msg.set_content(text_body); msg.add_alternative(html_body,subtype="html")
+    if logo_bytes:
+        mt,st=logo_mime.split("/",1) if "/" in logo_mime else ("image","jpeg")
+        msg.get_payload()[1].add_related(logo_bytes,maintype=mt,subtype=st,cid="<rachna_logo>",filename="rachna-logo")
+    try:
+        if port==465:
+            with smtplib.SMTP_SSL(host,port,context=ssl.create_default_context(),timeout=15) as smtp:
+                smtp.login(user,pw); smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host,port,timeout=15) as smtp:
+                smtp.ehlo(); smtp.starttls(context=ssl.create_default_context()); smtp.ehlo(); smtp.login(user,pw); smtp.send_message(msg)
+        log_email_message(recipient,"",subject,text_body,html_body,email_type,status="Sent",sender_email=user,sender_name=from_name)
+        return True,"Email sent successfully."
+    except Exception as e:
+        err=f"{type(e).__name__}: {e}"; log_email_message(recipient,"",subject,text_body,html_body,email_type,status="Failed",error_message=err,sender_email=user,sender_name=from_name)
+        return False,f"Email failed: {err}"
+
+def send_registration_otp(email, name, otp):
+    subject=f"{email_brand_name()} — Email Verification OTP"
+    logo_html,logo_bytes,logo_mime=get_email_logo()
+    body=f'<div style="text-align:center;"><h2 style="color:#071b33;margin:0 0 8px;">Verify your email</h2><p style="color:#5b6778;">Hello {html.escape(name)}, use this 6-digit OTP to complete registration.</p><div style="display:inline-block;background:#fff;color:#071b33;font-size:32px;font-weight:800;letter-spacing:9px;padding:16px 22px;border-radius:14px;border:1px solid #d6ae52;margin:14px 0;">{otp}</div><p style="color:#777;font-size:13px;">Valid for 5 minutes · One-time use</p></div>'
+    html_body=email_shell(body,logo_html,"Verify your email","EMAIL VERIFICATION OTP")
+    text_body=f"Hello {name},\n\nYour 6-digit OTP is: {otp}\n\nValid for 5 minutes and one-time use.\n\n{email_brand_name()}"
+    host=cfg("SMTP_HOST","smtp.gmail.com"); port=int(cfg("SMTP_PORT","587")); user=cfg("SMTP_USER") or cfg("SMTP_USERNAME") or cfg("SMTP_EMAIL"); pw=cfg("SMTP_PASSWORD"); from_name=str(cfg("SMTP_FROM_NAME") or email_brand_name()).strip()
+    if not user or not pw: return False,"SMTP_USER/SMTP_PASSWORD are not configured."
+    msg=EmailMessage(); msg["Subject"]=subject; msg["From"]=f"{from_name} <{user}>"; msg["To"]=email; msg.set_content(text_body); msg.add_alternative(html_body,subtype="html")
+    if logo_bytes:
+        mt,st=logo_mime.split("/",1) if "/" in logo_mime else ("image","jpeg"); msg.get_payload()[1].add_related(logo_bytes,maintype=mt,subtype=st,cid="<rachna_logo>",filename="rachna-logo")
+    try:
+        if port==465:
+            with smtplib.SMTP_SSL(host,port,context=ssl.create_default_context(),timeout=15) as smtp: smtp.login(user,pw); smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host,port,timeout=15) as smtp: smtp.ehlo(); smtp.starttls(context=ssl.create_default_context()); smtp.ehlo(); smtp.login(user,pw); smtp.send_message(msg)
+        log_email_message(email,"",subject,text_body,html_body,"OTP",status="Sent",sender_email=user,sender_name=from_name)
+        return True,"OTP email sent."
+    except Exception as e:
+        err=f"{type(e).__name__}: {e}"; log_email_message(email,"",subject,text_body,html_body,"OTP",status="Failed",error_message=err,sender_email=user,sender_name=from_name); return False,f"OTP email failed: {err}"
 
 
 def admin_credentials():
@@ -469,10 +533,48 @@ def release_upload_lock(lock_key):
     st.session_state[lock_key] = False
 
 
+def emails_page():
+    if not st.session_state.get('admin'):
+        st.error('Admin login required.'); return
+    page_header('EMAIL CENTER','Emails','Send Rachna-branded emails and view emails sent from this app')
+    tab_send, tab_inbox = st.tabs(['✉ Send Mail','📥 Mailbox'])
+    with tab_send:
+        with st.form('admin_send_mail_form', clear_on_submit=False):
+            recipient=st.text_input('To Email *', placeholder='customer@example.com')
+            subject=st.text_input('Subject *', placeholder='Your message subject')
+            details=st.text_area('Details *', height=220, placeholder='Write your message here...')
+            send=st.form_submit_button('Send Mail', type='primary', use_container_width=True)
+        if send:
+            ok,msg=send_generic_email(recipient,subject,details,'Admin Manual')
+            if ok: st.success(msg)
+            else: st.error(msg)
+    with tab_inbox:
+        search=st.text_input('Search mails', placeholder='Email, subject, order...')
+        rows=query('SELECT id,sender_email,sender_name,recipient_email,cc_email,subject,text_body,html_body,email_type,related_order_id,status,error_message,created_at FROM rachna_email_log ORDER BY created_at DESC LIMIT 500')
+        if search.strip():
+            q=search.strip().casefold(); rows=[r for r in rows if q in ' '.join(str(r.get(k) or '') for k in ('sender_email','sender_name','recipient_email','cc_email','subject','email_type','related_order_id')).casefold()]
+        if not rows:
+            st.info('No emails found. Emails sent by OTP, orders and Admin → Emails will appear here.')
+        else:
+            for r in rows:
+                status_icon='✅' if r.get('status')=='Sent' else '❌'; when=str(r.get('created_at') or '')
+                label=f"{status_icon} {r.get('subject') or '(No subject)'} · {r.get('recipient_email') or ''} · {when}"
+                with st.expander(label, expanded=False):
+                    c1,c2=st.columns([3,1])
+                    c1.markdown(f"**From:** {html.escape(str(r.get('sender_name') or email_brand_name()))} <{html.escape(str(r.get('sender_email') or ''))}>  \n**To:** {html.escape(str(r.get('recipient_email') or ''))}  \n**CC:** {html.escape(str(r.get('cc_email') or '—'))}  \n**Type:** {html.escape(str(r.get('email_type') or ''))}  \n**Date:** {html.escape(when)}")
+                    c2.metric('Status',str(r.get('status') or ''))
+                    if r.get('status')!='Sent' and r.get('error_message'): st.error(str(r['error_message']))
+                    st.divider()
+                    if r.get('html_body'): st.components.v1.html(str(r['html_body']),height=700,scrolling=True)
+                    else: st.text(str(r.get('text_body') or ''))
+
+
 def site_admin_page():
     if not st.session_state.get('admin'):
         st.error('Admin login required.'); return
     page_header('SITE CONTROL CENTER','Admin Master','Brand, visibility, product sizing and admin access')
+    if st.button('✉ Open Emails', type='primary', use_container_width=True, key='open_emails_from_admin_master'):
+        st.session_state.page='Emails'; st.rerun()
     with st.expander('Brand logo & backgrounds',expanded=True):
         existing=get_setting('app_logo')
         if existing and image_row_source(existing): st.image(image_row_source(existing),caption='Current app logo',width=180)
@@ -657,7 +759,7 @@ def build_invoice_pdf(order):
     buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=A4,rightMargin=36,leftMargin=36,topMargin=36,bottomMargin=36)
     styles=getSampleStyleSheet(); title=ParagraphStyle("it",parent=styles["Title"],alignment=TA_CENTER,fontSize=20,textColor=colors.HexColor("#071b33")); normal=ParagraphStyle("in",parent=styles["Normal"],fontSize=10,leading=14); right=ParagraphStyle("ir",parent=normal,alignment=TA_RIGHT)
     no=str(order.get("order_number") or order.get("id") or "—")
-    story=[Paragraph("RACHNA PLAYWOOD &amp; HARDWEAR",title),Paragraph("ORDER INVOICE",ParagraphStyle("sub",parent=title,fontSize=14,textColor=colors.HexColor("#b48618"))),Spacer(1,12)]
+    story=[Paragraph(html.escape(email_brand_name()),title),Paragraph("ORDER INVOICE",ParagraphStyle("sub",parent=title,fontSize=14,textColor=colors.HexColor("#b48618"))),Spacer(1,12)]
     meta=Table([[Paragraph(f"<b>Order:</b> {html.escape(no)}",normal),Paragraph(f"<b>Date:</b> {html.escape(str(order.get('created_at') or date.today()))}",right)],[Paragraph(f"<b>Customer:</b> {html.escape(str(order.get('customer_name') or ''))}",normal),Paragraph(f"<b>Email:</b> {html.escape(str(order.get('customer_email') or ''))}",right)]],colWidths=[270,240]); meta.setStyle(TableStyle([("BOX",(0,0),(-1,-1),.5,colors.HexColor("#d6ae52")),("INNERGRID",(0,0),(-1,-1),.25,colors.HexColor("#e5e7eb")),("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#fffaf0")),("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8)])); story += [meta,Spacer(1,18)]
     tbl=Table([["Product","Category","Qty","Unit Price","Total"],[str(order.get("product_name") or ""),str(order.get("category") or ""),str(order.get("quantity") or ""),money(order.get("unit_price")),money(order.get("total_price"))]],colWidths=[180,100,45,90,95]); tbl.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#071b33")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("GRID",(0,0),(-1,-1),.35,colors.HexColor("#d9dde3")),("ALIGN",(2,1),(-1,-1),"RIGHT"),("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8)])); story += [tbl,Spacer(1,18)]
     info=Table([["Payment",str(order.get("payment_method") or "COD")],["Payment status",str(order.get("payment_status") or "Pending")],["Order status",str(order.get("order_status") or "Order Placed")],["Delivery date",str(order.get("delivery_date") or "")],["Phone",str(order.get("phone") or "")],["Address",str(order.get("address") or "")]],colWidths=[130,380]); info.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.3,colors.HexColor("#e5e7eb")),("BACKGROUND",(0,0),(0,-1),colors.HexColor("#f5f7fa")),("FONTNAME",(0,0),(0,-1),"Helvetica-Bold"),("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)])); story += [info,Spacer(1,20),Paragraph("Thank you for choosing Rachna Playwood &amp; Hardwear.",normal)]
@@ -671,7 +773,7 @@ def send_order_email(order, debug=False, event_title="Order Confirmation"):
     host=cfg('SMTP_HOST'); user=cfg('SMTP_USER', cfg('SMTP_USERNAME', cfg('SMTP_EMAIL'))); pw=cfg('SMTP_PASSWORD')
     customer_email=str(order.get('customer_email') or '').strip()
     admin_email=str(cfg('ADMIN_EMAIL') or cfg('ORDER_EMAIL') or cfg('SMTP_TO') or '').strip()
-    from_name=str(cfg('SMTP_FROM_NAME') or APP_NAME).strip()
+    from_name=str(cfg('SMTP_FROM_NAME') or email_brand_name()).strip()
     port_raw=cfg('SMTP_PORT','465')
     log('Step 1/7: Reading SMTP secrets and order recipient')
     log(f'SMTP_HOST present: {bool(host)}'); log(f'SMTP_USER/USERNAME/EMAIL present: {bool(user)}'); log(f'SMTP_PASSWORD present: {bool(pw)}')
@@ -713,7 +815,7 @@ def send_order_email(order, debug=False, event_title="Order Confirmation"):
     live_track=tracking_url(order)
     track_block=(f'<div style="margin-top:18px;text-align:center"><a href="{html.escape(live_track,quote=True)}" style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;font-weight:800;padding:12px 20px;border-radius:10px">View live order status</a><div style="font-size:11px;color:#777;margin-top:7px">Status changes appear here automatically. No new email is sent for every status change.</div></div>' if live_track else '<div style="margin-top:18px;text-align:center;font-size:12px;color:#777">Add APP_URL in Streamlit Secrets to enable live tracking from this email.</div>')
     customer=html.escape(str(order.get('customer_name') or '')); phone=html.escape(str(order.get('phone') or '')); address=html.escape(str(order.get('address') or '—')); delivery=html.escape(str(order.get('delivery_date') or '')); category=html.escape(str(order.get('category') or '')); product_name=html.escape(str(order.get('product_name') or '')); quantity=html.escape(str(order.get('quantity') or '')); unit_price=html.escape(money(order.get('unit_price'))); total=html.escape(money(order.get('total_price')))
-    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:700;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div><div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">Order received</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">Your order has been successfully placed.</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div>{track_block}</td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">RACHNA PLAYWOOD &amp; HARDWEAR</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
+    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:800;">{html.escape(email_brand_name())}</div><div style="color:#d6ae52;font-size:12px;letter-spacing:3px;text-transform:uppercase;font-weight:700;margin-top:7px;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div><div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">Order received</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">Your order has been successfully placed.</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div>{track_block}</td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">{html.escape(email_brand_name())}</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
     text_body=(f"RACHNA PLAYWOOD & HARDWEAR - Order Confirmation\n\nThank you, {order.get('customer_name') or ''}!\n\nProduct: {order.get('product_name') or ''}\nCategory: {order.get('category') or ''}\nQuantity: {order.get('quantity') or ''}\nUnit price: {money(order.get('unit_price'))}\nTotal: {money(order.get('total_price'))}\n\nPhone: {order.get('phone') or ''}\nDelivery date: {order.get('delivery_date') or ''}\nAddress: {order.get('address') or ''}\n\nLive tracking: {live_track or 'Set APP_URL in Streamlit Secrets to enable it.'}\n")
     email_msg=EmailMessage(); email_msg['Subject']=f"Rachna Order #{order.get('order_number') or order.get('id') or ''} — {event_title}"; email_msg['From']=f'{from_name} <{user}>'; email_msg['To']=customer_email
     if admin_email and admin_email.lower()!=customer_email.lower(): email_msg['Cc']=admin_email
@@ -734,7 +836,7 @@ def send_order_email(order, debug=False, event_title="Order Confirmation"):
             log(f'Step 2/7: Connecting using SMTP on port {port}')
             with smtplib.SMTP(host,port,timeout=15) as smtp:
                 log('Step 3/7: SMTP connection successful'); log('Step 4/7: Starting TLS'); smtp.ehlo(); smtp.starttls(context=ssl.create_default_context()); smtp.ehlo(); log('TLS successful; logging in'); smtp.login(user,pw); log('Step 5/7: SMTP login successful'); smtp.send_message(email_msg,to_addrs=recipients); log(f'Step 6/7: Email accepted for {len(recipients)} recipient(s)')
-        log('Step 7/7: Order email process completed'); return True,'Order confirmation email accepted by SMTP server'
+        log('Step 7/7: Order email process completed'); log_email_message(customer_email, admin_email if admin_email and admin_email.lower()!=customer_email.lower() else '', email_msg.get('Subject') or '', text_body, html_body, 'Order', related_order_id=order.get('id'), status='Sent', sender_email=user, sender_name=from_name); return True,'Order confirmation email accepted by SMTP server'
     except smtplib.SMTPAuthenticationError as e:
         msg=f'SMTP authentication failed. Check Gmail App Password/username. SMTP code={getattr(e,"smtp_code","?")}'; log('FAILED: '+msg); return False,msg
     except smtplib.SMTPConnectError as e:
@@ -1179,7 +1281,7 @@ def main():
         icon=(f"<img src='{html.escape(dp,quote=True)}' style='width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #d6ae52'>" if dp else "<div style='width:44px;height:44px;border-radius:50%;background:#071b33;border:2px solid #d6ae52;display:flex;align-items:center;justify-content:center;font-size:22px'>👤</div>")
         st.markdown(f"<a href='?page=Account' title='Open profile' style='position:fixed;top:.55rem;right:.75rem;z-index:999999;text-decoration:none'>{icon}</a>",unsafe_allow_html=True)
     qp=st.query_params.get('page')
-    if qp in {'Home','Gallery','Order','Order History','Account','Order Details','Track Order','About','Contact Us','Master Gallery','Master Account','Admin Master','Login'}:
+    if qp in {'Home','Gallery','Order','Order History','Account','Order Details','Track Order','About','Contact Us','Master Gallery','Master Account','Admin Master','Emails','Login'}:
         st.session_state.page=qp
     # Keep the sidebar usable while replacing its visible Streamlit header control with the custom button.
     with st.sidebar:
@@ -1188,7 +1290,7 @@ def main():
         st.markdown('<div style="text-align:center;color:#d6ae52;font-weight:800">RACHNA PLAYWOOD & HARDWARE</div>',unsafe_allow_html=True)
         st.divider()
         if st.session_state.admin:
-            nav=['Home','Gallery','Order','Account','Order Details','About','Contact Us','Master Gallery','Master Account','Admin Master']
+            nav=['Home','Gallery','Order','Account','Order Details','Emails','About','Contact Us','Master Gallery','Master Account','Admin Master']
         elif st.session_state.user_id:
             nav=['Home','Gallery','Order','Order History','Account','About','Contact Us']
         else:
@@ -1227,6 +1329,7 @@ def main():
     elif p=='Order History': user_order_history()
     elif p=='Track Order': public_track_page()
     elif p=='Order Details': admin_orders_page()
+    elif p=='Emails': emails_page()
     elif p=='Account': account(False)
     elif p=='Master Account': account(True)
     elif p=='Admin Master': site_admin_page()
