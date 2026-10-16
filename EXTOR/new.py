@@ -666,7 +666,7 @@ def site_admin_page():
         w=st.slider('Product image width (%)',60,100,int(float(text_setting('product_image_width','100')))); h=st.slider('Product image height (px)',80,300,int(float(text_setting('product_image_height','150')))); save=st.form_submit_button('Save product size',type='primary')
     if save: save_text_setting('product_image_width',w); save_text_setting('product_image_height',h); st.success('Product size saved.'); st.rerun()
     st.subheader('Page access / public visibility')
-    public_pages=['Home','Gallery','Order','Account','About','Contact Us']
+    public_pages=['Home','Gallery','Order','Your Bag','Track Order','Order History','Account','About','Contact Us']
     for pg in public_pages: query('INSERT INTO rachna_page_config(page_name,visible) VALUES(%s,TRUE) ON CONFLICT(page_name) DO NOTHING',(pg,),fetch=False)
     page_rows=query('SELECT page_name,visible FROM rachna_page_config WHERE page_name=ANY(%s) ORDER BY page_name',(public_pages,))
     with st.form('page_visibility_form'):
@@ -869,7 +869,7 @@ def build_invoice_pdf(order):
     info=Table([['Payment',str(order.get('payment_method') or 'COD')],['Payment status',str(order.get('payment_status') or 'Pending')],['Order status',str(order.get('order_status') or 'Order Placed')],['Delivery date',str(order.get('delivery_date') or '')],['Phone',str(order.get('phone') or '')],['Address',str(order.get('address') or '')]],colWidths=[130,380]); info.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.3,colors.HexColor('#e5e7eb')),('BACKGROUND',(0,0),(0,-1),colors.HexColor('#f5f7fa')),('FONTNAME',(0,0),(0,-1),'Helvetica-Bold'),('TOPPADDING',(0,0),(-1,-1),7),('BOTTOMPADDING',(0,0),(-1,-1),7)])); story += [info,Spacer(1,20),Paragraph('Thank you for choosing RACHNA PLAYWOOD &amp; HARDWEAR VADGAM.',normal)]
     doc.build(story); return buf.getvalue()
 
-def send_order_email(order, debug=False, event_title="Order Confirmation"):
+def send_order_email(order, debug=False, event_title="Order Confirmation", send=True):
     # Authenticated SMTP account sends the message; logged-in customer is the primary recipient.
     def log(msg):
         print(f'[RACHNA EMAIL] {msg}', flush=True)
@@ -934,6 +934,19 @@ def send_order_email(order, debug=False, event_title="Order Confirmation"):
         maintype, subtype = logo_mime.split('/',1) if '/' in logo_mime else ('image','jpeg')
         email_msg.get_payload()[1].add_related(logo_bytes, maintype=maintype, subtype=subtype, cid='<rachna_logo>', filename='rachna-logo')
     recipients=[customer_email]+([admin_email] if admin_email and admin_email.lower()!=customer_email.lower() else [])
+    # For status changes we NEVER send another message. Instead update the single
+    # original order email stored in the app mailbox so its software preview stays
+    # live. A delivered Gmail message itself cannot be edited after delivery.
+    if not send:
+        try:
+            rows=query('SELECT id FROM rachna_email_log WHERE related_order_id=%s AND email_type=\'Order\' ORDER BY created_at ASC LIMIT 1',(order.get('id'),))
+            if rows:
+                query('UPDATE rachna_email_log SET text_body=%s, html_body=%s, subject=%s, recipient_email=%s, cc_email=%s, status=\'Sent\', error_message=NULL WHERE id=%s',(text_body,html_body,email_msg.get('Subject') or '',customer_email,admin_email if admin_email and admin_email.lower()!=customer_email.lower() else '',rows[0]['id']),fetch=False)
+                return True,'Original order email updated in app mailbox; no new email sent'
+            log_email_message(customer_email, admin_email if admin_email and admin_email.lower()!=customer_email.lower() else '', email_msg.get('Subject') or '', text_body, html_body, 'Order', related_order_id=order.get('id'), status='Sent', sender_email=user, sender_name=from_name)
+            return True,'Original order email snapshot created in app mailbox; no new email sent'
+        except Exception as e:
+            return False,f'Could not update original order email: {type(e).__name__}: {e}'
     try:
         if port==465:
             log('Step 2/7: Connecting using SMTP SSL on port 465')
@@ -1318,10 +1331,18 @@ def admin_orders_page():
                     query('UPDATE rachna_orders SET order_status=%s,payment_status=%s,updated_at=NOW() WHERE id=%s',(ns,ps,r['id']),fetch=False)
                     if status_changed or payment_changed or note.strip():
                         query('INSERT INTO rachna_order_status_history(order_id,status,note) VALUES(%s,%s,%s)',(r['id'],ns,note.strip()),fetch=False)
-                    # No second email on status updates. The original confirmation email
-                    # contains a live tracking link, so it always shows the latest status.
                     if status_changed or payment_changed:
-                        st.success(f"Status updated to {ns}. No new email sent; the original email's live tracking link now shows the updated status.")
+                        # Update the ONE original order email inside the app mailbox.
+                        # This does not send another SMTP/Gmail message.
+                        fresh=query('SELECT * FROM rachna_orders WHERE id=%s',(r['id'],))
+                        email_sync_ok=True
+                        email_sync_msg=''
+                        if fresh:
+                            email_sync_ok,email_sync_msg=send_order_email(dict(fresh[0]), event_title='Order Placed', send=False)
+                        if email_sync_ok:
+                            st.success(f"Status updated to {ns}. The original order email is updated in the app mailbox; no new email was sent.")
+                        else:
+                            st.warning(f"Status updated to {ns}, but the original email preview could not be refreshed: {email_sync_msg}")
                     else:
                         st.success('Order details saved.')
                     st.rerun()
