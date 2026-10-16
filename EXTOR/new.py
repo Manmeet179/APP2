@@ -23,7 +23,6 @@ st.set_page_config(page_title=APP_NAME, page_icon="🪵", layout="wide", initial
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
 header[data-testid="stHeader"]{display:flex!important;background:transparent!important;height:3.25rem!important;visibility:visible!important}
 #MainMenu{visibility:hidden!important}.stDeployButton{display:none!important}
 header[data-testid="stHeader"] [data-testid="stToolbar"]{visibility:visible!important}
@@ -638,7 +637,7 @@ def site_admin_page():
         st.error('Admin login required.'); return
     page_header('SITE CONTROL CENTER','Admin Master','Brand, visibility, product sizing and admin access')
     if st.button('✉ Open Emails', type='primary', use_container_width=True, key='open_emails_from_admin_master'):
-        st.session_state.page='Emails'; st.rerun()
+        st.session_state.page='Emails'; st.session_state._consumed_page_qp='Emails'; st.rerun()
     with st.expander('Brand logo & backgrounds',expanded=True):
         existing=get_setting('app_logo')
         if existing and image_row_source(existing): st.image(image_row_source(existing),caption='Current app logo',width=180)
@@ -748,9 +747,13 @@ def find_user_by_id(uid):
     return rows[0] if rows else None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def current_user_by_id(uid):
+    return find_user_by_id(uid) if uid else None
+
 def current_user():
     uid=st.session_state.get("user_id")
-    return find_user_by_id(uid) if uid else None
+    return current_user_by_id(uid) if uid else None
 
 
 def lookup_pincode(pin):
@@ -972,14 +975,14 @@ def login_page():
             submit = st.form_submit_button("Sign in", type="primary", use_container_width=True)
         if submit:
             if password_ok(uid, pin):
-                st.session_state.admin=True; st.session_state.user_id=None; st.session_state.page="Home"; st.rerun()
+                st.session_state.admin=True; st.session_state.user_id=None; st.session_state.page="Home"; st.session_state._consumed_page_qp="Home"; st.rerun()
             else:
                 rows=query("SELECT id,password_hash,is_admin,email_verified FROM rachna_users WHERE (email=%s OR phone=%s) AND active=TRUE LIMIT 1", (uid.strip().lower(),uid.strip()))
                 if not rows: st.error("Account not found. Please create an account first.")
                 elif not bool(rows[0].get("email_verified")): st.warning("Your email is not verified. Please register again.")
                 elif len(pin)!=4 or not pin.isdigit() or not rows[0].get("password_hash"): st.error("Enter your 4-digit PIN.")
                 elif hmac.compare_digest(password_hash(pin),str(rows[0]["password_hash"])):
-                    st.session_state.user_id=int(rows[0]["id"]); st.session_state.admin=bool(rows[0].get("is_admin")); st.session_state.page="Home"; st.rerun()
+                    st.session_state.user_id=int(rows[0]["id"]); st.session_state.admin=bool(rows[0].get("is_admin")); st.session_state.page="Home"; st.session_state._consumed_page_qp="Home"; st.rerun()
                 else: st.error("Incorrect email/phone or PIN.")
     with tabs[1]:
         pending=st.session_state.get("registration_pending")
@@ -1151,6 +1154,7 @@ def account(master=False):
                 final_addr=auto if auto and not address.strip() else address.strip()
                 query("UPDATE rachna_users SET age=%s,address=%s,pincode=%s,updated_at=NOW() WHERE id=%s",(int(age),final_addr,pin.strip(),user['id']),fetch=False)
                 if new_dp: save_user_dp(new_dp,user['id'])
+                current_user_by_id.clear()
                 st.success("Profile updated."); st.rerun()
             if user.get('pincode'):
                 addr=lookup_pincode(user['pincode'])
@@ -1326,17 +1330,16 @@ def order_page():
 
 @st.cache_resource(show_spinner=False)
 def init_db_cached():
-    # Schema setup happens once per Streamlit server process, not on every rerun.
+    # All schema work runs once per Streamlit server process. Running ALTER TABLE
+    # on every widget interaction was a major source of slow page loads.
     init_db()
+    ensure_auth_schema()
     return True
 
 
 def main():
     try:
         init_db_cached()
-        # Do this outside the cached initializer too: Streamlit can keep the
-        # old init_db result after a code/data migration.
-        ensure_auth_schema()
     except Exception as e:
         st.error('PostgreSQL connection or table setup failed.'); st.code(str(e)); st.stop()
     if 'admin' not in st.session_state: st.session_state.admin=False
@@ -1351,8 +1354,13 @@ def main():
         icon=(f"<img src='{html.escape(dp,quote=True)}' style='width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #d6ae52'>" if dp else "<div style='width:44px;height:44px;border-radius:50%;background:#071b33;border:2px solid #d6ae52;display:flex;align-items:center;justify-content:center;font-size:22px'>👤</div>")
         st.markdown(f"<a href='?page=Account' title='Open profile' style='position:fixed;top:.55rem;right:.75rem;z-index:999999;text-decoration:none'>{icon}</a>",unsafe_allow_html=True)
     qp=st.query_params.get('page')
-    if qp in {'Home','Gallery','Order','Order History','Account','Order Details','Track Order','About','Contact Us','Master Gallery','Master Account','Admin Master','Emails','Login'}:
+    valid_pages={'Home','Gallery','Order','Order History','Account','Order Details','Track Order','About','Contact Us','Master Gallery','Master Account','Admin Master','Emails','Login'}
+    # Consume a page deep-link only once. Previously ?page=Account stayed in
+    # the browser URL, so every sidebar click was immediately forced back to
+    # Account on the next Streamlit rerun.
+    if qp in valid_pages and qp != st.session_state.get('_consumed_page_qp'):
         st.session_state.page=qp
+        st.session_state._consumed_page_qp=qp
     # Keep the sidebar usable while replacing its visible Streamlit header control with the custom button.
     with st.sidebar:
         logo=get_setting('app_logo')
@@ -1369,10 +1377,13 @@ def main():
             visible=public_page_names(); nav=[x for x in nav if x in visible or x=='Login']
         for p in nav:
             if st.button(p,key='nav_'+p,use_container_width=True,type='primary' if st.session_state.page==p else 'secondary'):
-                st.session_state.page=p; st.rerun()
+                st.session_state.page=p
+                st.session_state._consumed_page_qp=p
+                st.rerun()
         st.divider()
         if st.session_state.admin or st.session_state.user_id:
-            if st.button('Log out',use_container_width=True): st.session_state.admin=False; st.session_state.user_id=None; st.session_state.page='Login'; st.rerun()
+            if st.button('Log out',use_container_width=True):
+                st.session_state.admin=False; st.session_state.user_id=None; st.session_state.page='Login'; st.session_state._consumed_page_qp='Login'; st.rerun()
         st.caption('© Rachna Playwoo & Hardwear')
     p=st.session_state.page
     if not st.session_state.admin and p not in ('Login','Track Order') and not st.session_state.user_id:
