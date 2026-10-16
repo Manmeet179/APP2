@@ -1,3 +1,5 @@
-streamlit 
-psycopg2-binary 
+streamlit
+psycopg2-binary
 Pillow
+requests
+reportlab
