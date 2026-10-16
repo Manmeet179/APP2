@@ -6,12 +6,17 @@ Configure credentials in Streamlit Secrets; never hard-code database credentials
 Creates separate rachna_* tables in the configured PostgreSQL database and does not modify the existing tiffin table.
 """
 import io, os, hmac, base64, html, hashlib, smtplib, ssl, json, mimetypes
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 import streamlit as st
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from PIL import Image
 import requests
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 APP_NAME = "RACHNA PLAYWOOD & HARDWEAR"
 st.set_page_config(page_title=APP_NAME, page_icon="🪵", layout="wide", initial_sidebar_state="expanded")
@@ -128,6 +133,16 @@ def init_db():
     """CREATE TABLE IF NOT EXISTS rachna_admin_auth(id INTEGER PRIMARY KEY CHECK(id=1),admin_id TEXT NOT NULL,admin_password TEXT NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""",
     """CREATE TABLE IF NOT EXISTS rachna_users(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,phone TEXT NOT NULL UNIQUE,email TEXT NOT NULL UNIQUE,dp_url TEXT,dp_hash TEXT,age INTEGER,address TEXT,pincode TEXT,password_hash TEXT NOT NULL,staff_id BIGINT REFERENCES rachna_staff(id) ON DELETE SET NULL,is_admin BOOLEAN NOT NULL DEFAULT FALSE,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""",
     """CREATE TABLE IF NOT EXISTS rachna_orders(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES rachna_users(id) ON DELETE SET NULL,customer_name TEXT NOT NULL,phone TEXT NOT NULL,address TEXT,delivery_date DATE NOT NULL,product_id BIGINT REFERENCES rachna_products(id) ON DELETE SET NULL,category TEXT,product_name TEXT NOT NULL,quantity NUMERIC(12,2) NOT NULL CHECK(quantity>0),unit_price NUMERIC(12,2),total_price NUMERIC(12,2),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""",
+    """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS order_number TEXT""",
+    """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS customer_email TEXT""",
+    """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'COD'""",
+    """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'Pending'""",
+    """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS order_status TEXT DEFAULT 'Order Placed'""",
+    """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS uq_rachna_order_number ON rachna_orders(order_number) WHERE order_number IS NOT NULL""",
+    """CREATE INDEX IF NOT EXISTS idx_rachna_orders_user ON rachna_orders(user_id,created_at DESC)""",
+    """CREATE TABLE IF NOT EXISTS rachna_order_status_history(id BIGSERIAL PRIMARY KEY,order_id BIGINT NOT NULL REFERENCES rachna_orders(id) ON DELETE CASCADE,status TEXT NOT NULL,note TEXT,changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""",
+    """CREATE INDEX IF NOT EXISTS idx_rachna_order_status_history ON rachna_order_status_history(order_id,changed_at)""",
     """ALTER TABLE rachna_staff ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#3b82f6'""",
     """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS pincode TEXT""",
     """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS staff_id BIGINT REFERENCES rachna_staff(id) ON DELETE SET NULL""",
@@ -163,7 +178,7 @@ def password_ok(user_id, entered):
     return hmac.compare_digest(str(user_id), str(aid)) and hmac.compare_digest(str(entered), str(apw))
 
 
-PAGE_NAMES = ["Home", "Gallery", "Order", "Account", "Master Gallery", "Master Account", "About", "Contact Us", "Login", "Admin Master"]
+PAGE_NAMES = ["Home", "Gallery", "Order", "Account", "Order Details", "Master Gallery", "Master Account", "About", "Contact Us", "Login", "Admin Master"]
 SETTING_KEYS = {
     "App logo": "app_logo",
     **{f"{page} background": f"bg_{page.lower().replace(' ', '_')}" for page in PAGE_NAMES},
@@ -541,7 +556,33 @@ def save_user_dp(uploaded, user_id):
     return url
 
 
-def send_order_email(order, debug=False):
+
+def order_status_steps():
+    return ["Order Placed", "Order Confirmed", "Order on Shipment", "Order in the Way", "Order Delivered"]
+
+def status_index(status):
+    try: return order_status_steps().index(status)
+    except ValueError: return 0
+
+def tracking_html(status):
+    steps=order_status_steps(); current=status_index(status); cells=[]
+    for i,step in enumerate(steps):
+        done=i<=current; bg="#16a34a" if done else "#cbd5e1"; fg="#166534" if done else "#64748b"
+        cells.append(f'<td width="20%" align="center" style="font-size:10px;color:{fg};font-weight:700"><div style="width:24px;height:24px;border-radius:50%;background:{bg};color:white;line-height:24px;margin:auto">{"✓" if done else i+1}</div><div style="margin-top:6px">{html.escape(step)}</div></td>')
+    width=max(5,current*25+12.5)
+    return '<table width="100%"><tr>'+''.join(cells)+'</tr><tr><td colspan="5"><div style="height:6px;background:#e5e7eb;border-radius:8px"><div style="height:6px;background:#16a34a;border-radius:8px;width:'+str(width)+'%"></div></div></td></tr></table>'
+
+def build_invoice_pdf(order):
+    buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=A4,rightMargin=36,leftMargin=36,topMargin=36,bottomMargin=36)
+    styles=getSampleStyleSheet(); title=ParagraphStyle("it",parent=styles["Title"],alignment=TA_CENTER,fontSize=20,textColor=colors.HexColor("#071b33")); normal=ParagraphStyle("in",parent=styles["Normal"],fontSize=10,leading=14); right=ParagraphStyle("ir",parent=normal,alignment=TA_RIGHT)
+    no=str(order.get("order_number") or order.get("id") or "—")
+    story=[Paragraph("RACHNA PLAYWOOD &amp; HARDWEAR",title),Paragraph("ORDER INVOICE",ParagraphStyle("sub",parent=title,fontSize=14,textColor=colors.HexColor("#b48618"))),Spacer(1,12)]
+    meta=Table([[Paragraph(f"<b>Order:</b> {html.escape(no)}",normal),Paragraph(f"<b>Date:</b> {html.escape(str(order.get('created_at') or date.today()))}",right)],[Paragraph(f"<b>Customer:</b> {html.escape(str(order.get('customer_name') or ''))}",normal),Paragraph(f"<b>Email:</b> {html.escape(str(order.get('customer_email') or ''))}",right)]],colWidths=[270,240]); meta.setStyle(TableStyle([("BOX",(0,0),(-1,-1),.5,colors.HexColor("#d6ae52")),("INNERGRID",(0,0),(-1,-1),.25,colors.HexColor("#e5e7eb")),("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#fffaf0")),("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8)])); story += [meta,Spacer(1,18)]
+    tbl=Table([["Product","Category","Qty","Unit Price","Total"],[str(order.get("product_name") or ""),str(order.get("category") or ""),str(order.get("quantity") or ""),money(order.get("unit_price")),money(order.get("total_price"))]],colWidths=[180,100,45,90,95]); tbl.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#071b33")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("GRID",(0,0),(-1,-1),.35,colors.HexColor("#d9dde3")),("ALIGN",(2,1),(-1,-1),"RIGHT"),("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8)])); story += [tbl,Spacer(1,18)]
+    info=Table([["Payment",str(order.get("payment_method") or "COD")],["Payment status",str(order.get("payment_status") or "Pending")],["Order status",str(order.get("order_status") or "Order Placed")],["Delivery date",str(order.get("delivery_date") or "")],["Phone",str(order.get("phone") or "")],["Address",str(order.get("address") or "")]],colWidths=[130,380]); info.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.3,colors.HexColor("#e5e7eb")),("BACKGROUND",(0,0),(0,-1),colors.HexColor("#f5f7fa")),("FONTNAME",(0,0),(0,-1),"Helvetica-Bold"),("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)])); story += [info,Spacer(1,20),Paragraph("Thank you for choosing Rachna Playwood &amp; Hardwear.",normal)]
+    doc.build(story); return buf.getvalue()
+
+def send_order_email(order, debug=False, event_title="Order Confirmation"):
     # Authenticated SMTP account sends the message; logged-in customer is the primary recipient.
     def log(msg):
         print(f'[RACHNA EMAIL] {msg}', flush=True)
@@ -585,12 +626,14 @@ def send_order_email(order, debug=False):
         log(f'Logo lookup warning: {type(e).__name__}: {e}')
     logo_html=('<img src="cid:rachna_logo" alt="Rachna Playwood & Hardwear" style="max-height:76px;max-width:240px;display:block;margin:0 auto 12px;object-fit:contain;">' if logo_bytes else (f'<img src="{html.escape(logo_url, quote=True)}" alt="Rachna Playwood & Hardwear" style="max-height:76px;max-width:240px;display:block;margin:0 auto 12px;object-fit:contain;">' if logo_url else '<div style="font-size:28px;font-weight:800;letter-spacing:1px;">RACHNA PLAYWOOD &amp; HARDWEAR</div>'))
     customer=html.escape(str(order.get('customer_name') or '')); phone=html.escape(str(order.get('phone') or '')); address=html.escape(str(order.get('address') or '—')); delivery=html.escape(str(order.get('delivery_date') or '')); category=html.escape(str(order.get('category') or '')); product_name=html.escape(str(order.get('product_name') or '')); quantity=html.escape(str(order.get('quantity') or '')); unit_price=html.escape(money(order.get('unit_price'))); total=html.escape(money(order.get('total_price')))
-    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:700;">ORDER CONFIRMATION</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">Order received</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">Your order has been successfully placed.</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div></td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">RACHNA PLAYWOOD &amp; HARDWEAR</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
+    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:700;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div><div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">Order received</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">Your order has been successfully placed.</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div></td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">RACHNA PLAYWOOD &amp; HARDWEAR</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
     text_body=(f"RACHNA PLAYWOOD & HARDWEAR - Order Confirmation\n\nThank you, {order.get('customer_name') or ''}!\n\nProduct: {order.get('product_name') or ''}\nCategory: {order.get('category') or ''}\nQuantity: {order.get('quantity') or ''}\nUnit price: {money(order.get('unit_price'))}\nTotal: {money(order.get('total_price'))}\n\nPhone: {order.get('phone') or ''}\nDelivery date: {order.get('delivery_date') or ''}\nAddress: {order.get('address') or ''}\n")
-    email_msg=EmailMessage(); email_msg['Subject']=f"Rachna Order Confirmation — {order.get('product_name') or 'Order'}"; email_msg['From']=user; email_msg['To']=customer_email
+    email_msg=EmailMessage(); email_msg['Subject']=f"Rachna Order #{order.get('order_number') or order.get('id') or ''} — {event_title}"; email_msg['From']=user; email_msg['To']=customer_email
     if admin_email and admin_email.lower()!=customer_email.lower(): email_msg['Cc']=admin_email
     email_msg.set_content(text_body)
     email_msg.add_alternative(html_body,subtype='html')
+    try: email_msg.add_attachment(build_invoice_pdf(order),maintype='application',subtype='pdf',filename=f"Rachna_Invoice_{order.get('order_number') or order.get('id')}.pdf")
+    except Exception as e: log(f'Invoice PDF warning: {type(e).__name__}: {e}')
     if logo_bytes:
         maintype, subtype = logo_mime.split('/',1) if '/' in logo_mime else ('image','jpeg')
         email_msg.get_payload()[1].add_related(logo_bytes, maintype=maintype, subtype=subtype, cid='<rachna_logo>', filename='rachna-logo')
@@ -613,6 +656,10 @@ def send_order_email(order, debug=False):
         msg=f'SMTP error: {e}'; log('FAILED: '+msg); return False,msg
     except Exception as e:
         msg=f'Email error: {type(e).__name__}: {e}'; log('FAILED: '+msg); return False,msg
+
+
+def send_order_status_email(order):
+    return send_order_email(order,debug=False)
 
 
 def apply_page_branding(page):
@@ -773,7 +820,7 @@ def account(master=False):
         if dp: st.markdown(f"<img class='dp' src='{html.escape(dp,quote=True)}'>",unsafe_allow_html=True)
         else: st.markdown("<div class='profile-card'>👤</div>",unsafe_allow_html=True)
         st.markdown(f"<div class='profile-card'><h2>{html.escape(user['name'])}</h2><div>{html.escape(user['email'])} · {html.escape(user['phone'])}</div></div>",unsafe_allow_html=True)
-        tabs=st.tabs(["Profile","Attendance"])
+        tabs=st.tabs(["Profile","Attendance","Order History"])
         with tabs[0]:
             with st.form("profile_edit"):
                 st.text_input("Name",user['name'],disabled=True); st.text_input("Phone",user['phone'],disabled=True); st.text_input("Email",user['email'],disabled=True); age=st.number_input("Age",1,120,int(user.get('age') or 18)); address=st.text_area("Address",user.get('address') or ''); pin=st.text_input("Pincode",value=user.get('pincode') or '',max_chars=6); new_dp=st.file_uploader("Change DP",type=['jpg','jpeg','png','webp']); save=st.form_submit_button("Save profile",type='primary')
@@ -803,6 +850,8 @@ def account(master=False):
                 att=query("SELECT work_date,status,notes FROM rachna_attendance WHERE staff_id=%s ORDER BY work_date DESC LIMIT 90",(staff['id'],))
                 for r in att:
                     st.markdown(f"<div class='att-row' style='border-left:5px solid {attendance_color(r['status'])}'><b>{r['work_date']}</b> · <span style='color:{attendance_color(r['status'])};font-weight:800'>{r['status']}</span> · {html.escape(r['notes'] or '')}</div>",unsafe_allow_html=True)
+        with tabs[2]:
+            user_order_history()
         return
     if not st.session_state.get('admin'):
         st.warning('Admin login required.'); return
@@ -845,50 +894,67 @@ def find_user_staff(staff_id):
     rows=query('SELECT * FROM rachna_staff WHERE id=%s AND active=TRUE',(staff_id,)); return rows[0] if rows else None
 
 
-def ensure_orders_table():
-    """Ensure the orders table exists before an order is inserted."""
-    query("""CREATE TABLE IF NOT EXISTS rachna_orders (
-        id BIGSERIAL PRIMARY KEY,
-        user_id BIGINT REFERENCES rachna_users(id) ON DELETE SET NULL,
-        customer_name TEXT NOT NULL,
-        phone TEXT NOT NULL,
-        address TEXT,
-        delivery_date DATE NOT NULL,
-        product_id BIGINT REFERENCES rachna_products(id) ON DELETE SET NULL,
-        category TEXT,
-        product_name TEXT NOT NULL,
-        quantity NUMERIC(12,2) NOT NULL CHECK (quantity > 0),
-        unit_price NUMERIC(12,2),
-        total_price NUMERIC(12,2),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )""", fetch=False)
-    query("CREATE INDEX IF NOT EXISTS idx_rachna_orders_date ON rachna_orders(created_at DESC)", fetch=False)
 
+def ensure_orders_table():
+    query("CREATE TABLE IF NOT EXISTS rachna_orders(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES rachna_users(id) ON DELETE SET NULL,customer_name TEXT NOT NULL,phone TEXT NOT NULL,address TEXT,delivery_date DATE NOT NULL,product_id BIGINT REFERENCES rachna_products(id) ON DELETE SET NULL,category TEXT,product_name TEXT NOT NULL,quantity NUMERIC(12,2) NOT NULL CHECK(quantity>0),unit_price NUMERIC(12,2),total_price NUMERIC(12,2),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),order_number TEXT,customer_email TEXT,payment_method TEXT DEFAULT 'COD',payment_status TEXT DEFAULT 'Pending',order_status TEXT DEFAULT 'Order Placed',updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",fetch=False)
+    query("CREATE TABLE IF NOT EXISTS rachna_order_status_history(id BIGSERIAL PRIMARY KEY,order_id BIGINT NOT NULL REFERENCES rachna_orders(id) ON DELETE CASCADE,status TEXT NOT NULL,note TEXT,changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",fetch=False)
+
+def user_order_history():
+    u=current_user(); page_header('MY ORDERS','Order History','Track every order and download your invoice')
+    if not u: st.info('Please login first.'); return
+    rows=query('SELECT * FROM rachna_orders WHERE user_id=%s ORDER BY created_at DESC',(u['id'],))
+    if not rows: st.info('No orders yet.'); return
+    for r in rows:
+        with st.container(border=True):
+            st.markdown(f"**#{r.get('order_number') or r['id']}** · {html.escape(str(r['product_name']))} · **{money(r.get('total_price'))}**")
+            st.markdown(tracking_html(str(r.get('order_status') or 'Order Placed')),unsafe_allow_html=True)
+            for h in query('SELECT status,note,changed_at FROM rachna_order_status_history WHERE order_id=%s ORDER BY changed_at',(r['id'],)): st.caption(f"✓ {h['status']} · {h['changed_at']} · {h.get('note') or ''}")
+            st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(r)),file_name=f"Rachna_Invoice_{r.get('order_number') or r['id']}.pdf",mime='application/pdf',key=f'uhpdf_{r["id"]}')
+
+def admin_orders_page():
+    if not st.session_state.get('admin'): st.warning('Admin login required.'); return
+    page_header('ORDER CONTROL','Order Details','Admin order management and customer notifications')
+    rows=query('SELECT * FROM rachna_orders ORDER BY created_at DESC LIMIT 1000')
+    if not rows: st.info('No orders found.'); return
+    statuses=order_status_steps()
+    for r in rows:
+        no=r.get('order_number') or str(r['id'])
+        with st.expander(f"#{no} · {r.get('customer_name')} · {r.get('product_name')} · {money(r.get('total_price'))}"):
+            st.markdown(tracking_html(str(r.get('order_status') or 'Order Placed')),unsafe_allow_html=True)
+            st.write(f"Customer: {r.get('customer_name')} · Email: {r.get('customer_email')} · Phone: {r.get('phone')}")
+            st.write(f"Product: {r.get('product_name')} · Qty: {r.get('quantity')} · Total: {money(r.get('total_price'))}")
+            st.write(f"Payment: {r.get('payment_method')} · Payment status: {r.get('payment_status')} · Delivery: {r.get('delivery_date')}")
+            cur=str(r.get('order_status') or 'Order Placed'); ns=st.selectbox('Order status',statuses,index=status_index(cur),key=f'os_{r["id"]}')
+            opts=['Pending','Paid','Failed','Refunded']; cps=str(r.get('payment_status') or 'Pending'); ps=st.selectbox('Payment status',opts,index=opts.index(cps) if cps in opts else 0,key=f'ps_{r["id"]}')
+            note=st.text_input('Tracking note',key=f'on_{r["id"]}')
+            if st.button('Save update & notify customer',type='primary',key=f'order_save_{r["id"]}'):
+                query('UPDATE rachna_orders SET order_status=%s,payment_status=%s,updated_at=NOW() WHERE id=%s',(ns,ps,r['id']),fetch=False)
+                query('INSERT INTO rachna_order_status_history(order_id,status,note) VALUES(%s,%s,%s)',(r['id'],ns,note.strip()),fetch=False)
+                updated=query('SELECT * FROM rachna_orders WHERE id=%s',(r['id'],))[0]
+                ok,msg=send_order_email(dict(updated),event_title=f'Order Update: {ns}')
+                st.success('Order updated and email notification sent.' if ok else 'Order updated, email failed: '+msg); st.rerun()
+            st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(r)),file_name=f'Rachna_Invoice_{no}.pdf',mime='application/pdf',key=f'ahpdf_{r["id"]}')
 
 def order_page():
-    page_header('ORDER','Place an Order','Choose a product, quantity and delivery details')
-    user=current_user(); items=products();
+    page_header('ORDER','Place an Order','Payment method, invoice and Amazon-style tracking')
+    user=current_user()
+    if not user: st.warning('Please login first.'); return
+    items=products()
     if not items: st.info('No products available.'); return
-    names=[p['title'] for p in items]; chosen=st.selectbox('Product',names); product=next(p for p in items if p['title']==chosen); qty=st.number_input('Quantity',min_value=1.0,step=1.0,value=1.0); total=float(product.get('price') or 0)*qty
-    st.markdown(f"<div class='hero'><h2>{money(total)}</h2><p>{html.escape(product['category'])} · {html.escape(product['title'])} · Qty {qty:g}</p></div>",unsafe_allow_html=True)
+    chosen=st.selectbox('Product',[p['title'] for p in items]); product=next(p for p in items if p['title']==chosen); qty=st.number_input('Quantity',min_value=1.0,step=1.0,value=1.0); total=float(product.get('price') or 0)*qty
     with st.form('order_form'):
-        name=st.text_input('Customer name',value=user['name'] if user else ''); phone=st.text_input('Phone',value=user['phone'] if user else ''); address=st.text_area('Address',value=user.get('address') if user else ''); delivery=st.date_input('Delivery date',value=date.today()+timedelta(days=2),min_value=date.today()+timedelta(days=2),max_value=date.today()+timedelta(days=2)); submit=st.form_submit_button('Submit order',type='primary')
+        name=st.text_input('Customer name',value=user['name']); phone=st.text_input('Phone',value=user['phone']); address=st.text_area('Delivery address',value=user.get('address') or ''); delivery=st.date_input('Delivery date',value=date.today()+timedelta(days=2),min_value=date.today()+timedelta(days=2)); payment=st.radio('Payment method',['COD','UPI','Credit / Debit Card','Online Payment'],horizontal=True); submit=st.form_submit_button('Place Order',type='primary',use_container_width=True)
+    st.markdown(f"<div class='hero'><h2>{money(total)}</h2><p>{html.escape(product['category'])} · {html.escape(product['title'])} · Qty {qty:g} · {html.escape(payment)}</p></div>",unsafe_allow_html=True)
     if submit:
-        if not name.strip() or not phone.strip(): st.error('Name and phone are required.')
-        else:
-            data={'customer_name':name.strip(),'customer_email':str(user.get('email') or '').strip() if user else '','phone':phone.strip(),'address':address.strip(),'delivery_date':delivery,'category':product['category'],'product_name':product['title'],'quantity':qty,'unit_price':product.get('price'),'total_price':total}
-            ensure_orders_table()
-            query('INSERT INTO rachna_orders(user_id,customer_name,phone,address,delivery_date,product_id,category,product_name,quantity,unit_price,total_price) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(user['id'] if user else None,*[data[k] for k in ['customer_name','phone','address','delivery_date']],product['id'],data['category'],data['product_name'],qty,data['unit_price'],total),fetch=False)
-            st.success('Step 1/2: Order saved successfully in PostgreSQL.')
-            debug_email = st.checkbox('Show email sending debug details', value=True, key='order_email_debug')
-            mailed, email_status = send_order_email(data, debug=debug_email)
-            if mailed:
-                st.success('Step 2/2: Email sent successfully. SMTP server accepted the message.')
-                st.info(f'Email destination: {data.get("customer_email") or "User email missing"} + Admin CC (if configured)')
-            else:
-                st.error('Step 2/2: Email was NOT sent.')
-                st.code(email_status)
-                st.warning('Order is saved, but email failed. Check the diagnostic steps above and Streamlit Manage App → Logs for the same [RACHNA EMAIL] messages.')
+        if not name.strip() or not phone.strip() or not address.strip(): st.error('Name, phone and delivery address are required.'); return
+        if payment!='COD': st.info('Payment method saved as Pending. Actual UPI/card collection requires a payment-gateway integration.')
+        ensure_orders_table(); no='RCH'+datetime.now().strftime('%Y%m%d%H%M%S')+str(user['id']).zfill(3)
+        row=query('''INSERT INTO rachna_orders(user_id,customer_name,phone,address,delivery_date,product_id,category,product_name,quantity,unit_price,total_price,order_number,customer_email,payment_method,payment_status,order_status,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()) RETURNING *''',(user['id'],name.strip(),phone.strip(),address.strip(),delivery,product['id'],product['category'],product['title'],qty,product.get('price'),total,no,str(user.get('email') or '').strip(),payment,'Pending','Order Placed'))[0]
+        query('INSERT INTO rachna_order_status_history(order_id,status,note) VALUES(%s,%s,%s)',(row['id'],'Order Placed','Order created by customer'),fetch=False)
+        ok,msg=send_order_email(dict(row),event_title='Order Placed')
+        st.success(f'Order #{no} placed successfully. '+('Confirmation + invoice sent to your email.' if ok else ''))
+        if not ok: st.warning('Email failed: '+msg)
+        st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(row)),file_name=f'Rachna_Invoice_{no}.pdf',mime='application/pdf',key=f'newpdf_{row["id"]}')
 
 
 @st.cache_resource(show_spinner=False)
@@ -911,7 +977,7 @@ def main():
         icon=(f"<img src='{html.escape(dp,quote=True)}' style='width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #d6ae52'>" if dp else "<div style='width:44px;height:44px;border-radius:50%;background:#071b33;border:2px solid #d6ae52;display:flex;align-items:center;justify-content:center;font-size:22px'>👤</div>")
         st.markdown(f"<a href='?page=Account' title='Open profile' style='position:fixed;top:.55rem;right:.75rem;z-index:999999;text-decoration:none'>{icon}</a>",unsafe_allow_html=True)
     qp=st.query_params.get('page')
-    if qp in {'Home','Gallery','Order','Account','About','Contact Us','Master Gallery','Master Account','Admin Master','Login'}:
+    if qp in {'Home','Gallery','Order','Account','Order Details','About','Contact Us','Master Gallery','Master Account','Admin Master','Login'}:
         st.session_state.page=qp
     # Keep the sidebar usable while replacing its visible Streamlit header control with the custom button.
     with st.sidebar:
@@ -920,7 +986,7 @@ def main():
         st.markdown('<div style="text-align:center;color:#d6ae52;font-weight:800">RACHNA PLAYWOOD & HARDWARE</div>',unsafe_allow_html=True)
         st.divider()
         if st.session_state.admin:
-            nav=['Home','Gallery','Order','Account','About','Contact Us','Master Gallery','Master Account','Admin Master']
+            nav=['Home','Gallery','Order','Account','Order Details','About','Contact Us','Master Gallery','Master Account','Admin Master']
         elif st.session_state.user_id:
             nav=['Home','Gallery','Order','Account','About','Contact Us']
         else:
@@ -956,6 +1022,7 @@ def main():
     elif p=='Gallery': gallery(False)
     elif p=='Master Gallery': gallery(True)
     elif p=='Order': order_page()
+    elif p=='Order Details': admin_orders_page()
     elif p=='Account': account(False)
     elif p=='Master Account': account(True)
     elif p=='Admin Master': site_admin_page()
