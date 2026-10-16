@@ -599,7 +599,7 @@ def emails_page():
     if not st.session_state.get('admin'):
         st.error('Admin login required.'); return
     ensure_email_log_table()
-    page_header('EMAIL CENTER','Emails','Send Rachna-branded emails and view emails sent from this app')
+    page_header('COMMUNICATIONS','Communications','Send Rachna-branded emails and view emails sent from this app')
     tab_send, tab_inbox = st.tabs(['✉ Send Mail','📥 Mailbox'])
     with tab_send:
         with st.form('admin_send_mail_form', clear_on_submit=False):
@@ -635,8 +635,8 @@ def emails_page():
 def site_admin_page():
     if not st.session_state.get('admin'):
         st.error('Admin login required.'); return
-    page_header('SITE CONTROL CENTER','Admin Master','Brand, visibility, product sizing and admin access')
-    if st.button('✉ Open Emails', type='primary', use_container_width=True, key='open_emails_from_admin_master'):
+    page_header('ADMIN CONSOLE','Admin Console','Brand, visibility, product sizing and admin access')
+    if st.button('✉ Open Communications', type='primary', use_container_width=True, key='open_emails_from_admin_master'):
         st.session_state.page='Emails'; st.session_state._consumed_page_qp='Emails'; st.rerun()
     with st.expander('Brand logo & backgrounds',expanded=True):
         existing=get_setting('app_logo')
@@ -880,10 +880,13 @@ def send_order_email(order, debug=False, event_title="Order Confirmation"):
         try: order['tracking_token']=ensure_tracking_token(order.get('id'))
         except Exception as te: log(f'Tracking token warning: {type(te).__name__}: {te}')
     live_track=tracking_url(order)
-    track_block=(f'<div style="margin-top:18px;text-align:center"><a href="{html.escape(live_track,quote=True)}" style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;font-weight:800;padding:12px 20px;border-radius:10px">View live order status</a><div style="font-size:11px;color:#777;margin-top:7px">Status changes appear here automatically. No new email is sent for every status change.</div></div>' if live_track else '<div style="margin-top:18px;text-align:center;font-size:12px;color:#777">Add APP_URL in Streamlit Secrets to enable live tracking from this email.</div>')
+    track_block=(f'<div style="margin-top:18px;text-align:center"><a href="{html.escape(live_track,quote=True)}" style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;font-weight:800;padding:12px 20px;border-radius:10px">View live order status</a><div style="font-size:11px;color:#777;margin-top:7px">Status changes appear here automatically, and Rachna sends a notification email when your order status is updated.</div></div>' if live_track else '<div style="margin-top:18px;text-align:center;font-size:12px;color:#777">Add APP_URL in Streamlit Secrets to enable live tracking from this email.</div>')
     customer=html.escape(str(order.get('customer_name') or '')); phone=html.escape(str(order.get('phone') or '')); address=html.escape(str(order.get('address') or '—')); delivery=html.escape(str(order.get('delivery_date') or '')); category=html.escape(str(order.get('category') or '')); product_name=html.escape(str(order.get('product_name') or '')); quantity=html.escape(str(order.get('quantity') or '')); unit_price=html.escape(money(order.get('unit_price'))); total=html.escape(money(order.get('total_price')))
-    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:800;">{html.escape(email_brand_name())}</div><div style="color:#d6ae52;font-size:12px;letter-spacing:3px;text-transform:uppercase;font-weight:700;margin-top:7px;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div><div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">Order received</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">Your order has been successfully placed.</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div>{track_block}</td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">{html.escape(email_brand_name())}</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
-    text_body=(f"RACHNA PLAYWOOD & HARDWEAR - Order Confirmation\n\nThank you, {order.get('customer_name') or ''}!\n\nProduct: {order.get('product_name') or ''}\nCategory: {order.get('category') or ''}\nQuantity: {order.get('quantity') or ''}\nUnit price: {money(order.get('unit_price'))}\nTotal: {money(order.get('total_price'))}\n\nPhone: {order.get('phone') or ''}\nDelivery date: {order.get('delivery_date') or ''}\nAddress: {order.get('address') or ''}\n\nLive tracking: {live_track or 'Set APP_URL in Streamlit Secrets to enable it.'}\n")
+    is_status_update=event_title.lower().startswith('order status')
+    notice_title='Order status updated' if is_status_update else 'Order received'
+    notice_text=f"Your order status is now <b>{html.escape(str(order.get('order_status') or 'Order Placed'))}</b>." if is_status_update else 'Your order has been successfully placed.'
+    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:800;">{html.escape(email_brand_name())}</div><div style="color:#d6ae52;font-size:12px;letter-spacing:3px;text-transform:uppercase;font-weight:700;margin-top:7px;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div><div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">{notice_title}</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">{notice_text}</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div>{track_block}</td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">{html.escape(email_brand_name())}</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
+    text_body=(f"RACHNA PLAYWOOD & HARDWEAR - {event_title}\n\nThank you, {order.get('customer_name') or ''}!\n\nCurrent status: {order.get('order_status') or 'Order Placed'}\n\nProduct: {order.get('product_name') or ''}\nCategory: {order.get('category') or ''}\nQuantity: {order.get('quantity') or ''}\nUnit price: {money(order.get('unit_price'))}\nTotal: {money(order.get('total_price'))}\n\nPhone: {order.get('phone') or ''}\nDelivery date: {order.get('delivery_date') or ''}\nAddress: {order.get('address') or ''}\n\nLive tracking: {live_track or 'Set APP_URL in Streamlit Secrets to enable it.'}\n")
     email_msg=EmailMessage(); email_msg['Subject']=f"Rachna Order #{order.get('order_number') or order.get('id') or ''} — {event_title}"; email_msg['From']=f'{from_name} <{user}>'; email_msg['To']=customer_email
     if admin_email and admin_email.lower()!=customer_email.lower(): email_msg['Cc']=admin_email
     email_msg.set_content(text_body)
@@ -1086,7 +1089,7 @@ def auto_product_card(product, ims, width, height):
 
 
 def gallery(master=False):
-    page_header("COLLECTION","Master Gallery" if master else "Gallery","Admin product management" if master else "Browse furniture, plywood and hardware products.")
+    page_header("COLLECTION","Rachna Collections" if master else "Collections","Admin product management" if master else "Browse furniture, plywood and hardware products.")
     if master and not st.session_state.get("admin"):
         st.warning("Admin login required."); return
     if master:
@@ -1136,7 +1139,7 @@ def attendance_color(status):
 def account(master=False):
     if not master:
         user=current_user()
-        page_header("ACCOUNT","My Account","Profile, attendance and personal details")
+        page_header("MY SPACE","My Space","Profile, attendance and personal details")
         if not user:
             st.info("Please sign in first.")
             if st.button("Go to Login",type="primary"): st.session_state.page="Login"; st.rerun()
@@ -1181,7 +1184,7 @@ def account(master=False):
         return
     if not st.session_state.get('admin'):
         st.warning('Admin login required.'); return
-    page_header("WORKSHOP MANAGEMENT","Master Account","Admin-only staff, attendance and ledger controls")
+    page_header("ACCOUNT CENTER","Account Center","Admin-only staff, attendance and ledger controls")
     staff_tab,att_tab,ledger_tab,week_tab=st.tabs(["Staff","Attendance","Account ledger","Weekly view"])
     with staff_tab:
         staff=query("SELECT * FROM rachna_staff WHERE active=TRUE ORDER BY name")
@@ -1228,7 +1231,7 @@ def ensure_orders_table():
     query("CREATE TABLE IF NOT EXISTS rachna_order_status_history(id BIGSERIAL PRIMARY KEY,order_id BIGINT NOT NULL REFERENCES rachna_orders(id) ON DELETE CASCADE,status TEXT NOT NULL,note TEXT,changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",fetch=False)
 
 def user_order_history():
-    u=current_user(); page_header('MY ORDERS','Order History','Track every order and download your invoice')
+    u=current_user(); page_header('ORDER HISTORY','Order History','Track every order and download your invoice')
     if not u: st.info('Please login first.'); return
     rows=query('SELECT * FROM rachna_orders WHERE user_id=%s ORDER BY created_at DESC',(u['id'],))
     if not rows: st.info('No orders yet.'); return
@@ -1252,7 +1255,7 @@ def user_order_history():
 
 def admin_orders_page():
     if not st.session_state.get('admin'): st.warning('Admin login required.'); return
-    page_header('ORDER CONTROL','Order Details','Admin order management · live tracking · delete controls')
+    page_header('ORDER HISTORY','Order History','Admin order management · live tracking · delete controls')
     rows=query('SELECT * FROM rachna_orders ORDER BY created_at DESC LIMIT 1000')
     if not rows: st.info('No orders found.'); return
     statuses=order_status_steps()
@@ -1269,10 +1272,23 @@ def admin_orders_page():
             c1,c2=st.columns(2)
             with c1:
                 if st.button('Save status update',type='primary',key=f'order_save_{r["id"]}'):
+                    status_changed = ns != cur
+                    payment_changed = ps != cps
                     query('UPDATE rachna_orders SET order_status=%s,payment_status=%s,updated_at=NOW() WHERE id=%s',(ns,ps,r['id']),fetch=False)
-                    if ns != cur or ps != cps or note.strip():
+                    if status_changed or payment_changed or note.strip():
                         query('INSERT INTO rachna_order_status_history(order_id,status,note) VALUES(%s,%s,%s)',(r['id'],ns,note.strip()),fetch=False)
-                    st.success('Status updated. Customer can see the new status from the same original email tracking link. No new email was sent.')
+                    # Refresh the order before sending so the email contains the NEW status.
+                    fresh=query('SELECT * FROM rachna_orders WHERE id=%s LIMIT 1',(r['id'],))
+                    mail_ok=True; mail_msg=''
+                    if fresh and (status_changed or payment_changed):
+                        mail_ok,mail_msg=send_order_email(dict(fresh[0]),event_title=f'Order Status: {ns}')
+                    if status_changed or payment_changed:
+                        if mail_ok:
+                            st.success(f'Status updated to {ns}. Customer notification email sent.')
+                        else:
+                            st.warning(f'Status updated to {ns}, but notification email failed: {mail_msg}')
+                    else:
+                        st.success('Order details saved.')
                     st.rerun()
             with c2:
                 if st.button('🗑 Delete order',key=f'order_del_{r["id"]}'):
@@ -1283,7 +1299,7 @@ def admin_orders_page():
 
 
 def public_track_page():
-    page_header('LIVE TRACKING','Track Your Order','The status below is read live from the order database.')
+    page_header('TRACK ORDER','Track Order','Track your orders live from one place.')
     token=str(st.query_params.get('track') or '').strip()
     if not token:
         st.info('Tracking link is missing or invalid.')
@@ -1305,8 +1321,62 @@ def public_track_page():
             st.markdown(f"**✓ {html.escape(str(h['status']))}** · {html.escape(str(h['changed_at']))}  \n{html.escape(str(h.get('note') or ''))}")
     st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(r)),file_name=f"Rachna_Invoice_{r.get('order_number') or r['id']}.pdf",mime='application/pdf',key=f'trackpdf_{r["id"]}')
 
+def user_track_order_page():
+    """Logged-in user's live order tracker. Latest order is shown first, followed by older orders."""
+    user=current_user()
+    page_header('TRACK ORDER','Track Order','Your latest order, live status and order summary')
+    if not user:
+        st.info('Please login first.')
+        return
+    rows=query('SELECT * FROM rachna_orders WHERE user_id=%s ORDER BY created_at DESC LIMIT 100',(user['id'],))
+    if not rows:
+        st.info('You have not placed any orders yet.')
+        if st.button('Start a New Order',type='primary'):
+            st.session_state.page='Order'; st.rerun()
+        return
+
+    latest=rows[0]
+    latest_status=str(latest.get('order_status') or 'Order Placed')
+    no=str(latest.get('order_number') or latest.get('id') or '')
+    # Compact order card first, as requested.
+    st.markdown(f"""<div style='background:#102c50;border:1px solid #d6ae52;border-radius:14px;padding:12px 15px;margin-bottom:12px'>
+      <div style='font-size:11px;color:#d6ae52;font-weight:800;letter-spacing:1.4px'>LATEST ORDER</div>
+      <div style='display:flex;justify-content:space-between;gap:10px;align-items:center;margin-top:4px'>
+        <div><b style='color:#fff'>#{html.escape(no)}</b><div style='font-size:12px;color:#cbd5e1'>{html.escape(str(latest.get('product_name') or ''))} · Qty {html.escape(str(latest.get('quantity') or ''))}</div></div>
+        <div style='text-align:right;color:#d6ae52;font-weight:800'>{html.escape(money(latest.get('total_price')))}</div>
+      </div></div>""",unsafe_allow_html=True)
+
+    # Status immediately below the compact order card.
+    st.markdown("<div style='font-size:13px;color:#d6ae52;font-weight:800;letter-spacing:1.2px;margin:8px 0'>ORDER STATUS</div>",unsafe_allow_html=True)
+    st.markdown(tracking_html(latest_status),unsafe_allow_html=True)
+    st.success(f'Current status: {latest_status}')
+
+    # Order summary below status.
+    st.markdown("<div style='font-size:13px;color:#d6ae52;font-weight:800;letter-spacing:1.2px;margin:16px 0 8px'>ORDER SUMMARY</div>",unsafe_allow_html=True)
+    summary_rows=[
+        ('Product',latest.get('product_name') or '—'),
+        ('Category',latest.get('category') or '—'),
+        ('Quantity',latest.get('quantity') or '—'),
+        ('Payment',f"{latest.get('payment_method') or 'COD'} · {latest.get('payment_status') or 'Pending'}"),
+        ('Delivery date',latest.get('delivery_date') or '—'),
+        ('Total',money(latest.get('total_price'))),
+    ]
+    st.markdown("<div style='background:#fff;border-radius:14px;padding:4px 14px;color:#172033'>" + ''.join(f"<div style='display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #eee'><span style='color:#777'>{html.escape(str(k))}</span><b style='text-align:right'>{html.escape(str(v))}</b></div>" for k,v in summary_rows) + "</div>",unsafe_allow_html=True)
+    st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(latest)),file_name=f'Rachna_Invoice_{no}.pdf',mime='application/pdf',key=f'user_track_pdf_{latest["id"]}')
+
+    if len(rows)>1:
+        st.markdown("<div style='font-size:13px;color:#d6ae52;font-weight:800;letter-spacing:1.2px;margin:18px 0 8px'>PREVIOUS ORDERS</div>",unsafe_allow_html=True)
+        for r in rows[1:]:
+            rn=str(r.get('order_number') or r.get('id') or '')
+            with st.expander(f"#{rn} · {r.get('product_name') or ''} · {money(r.get('total_price'))}"):
+                st.markdown(tracking_html(str(r.get('order_status') or 'Order Placed')),unsafe_allow_html=True)
+                st.caption(f"Status: {r.get('order_status') or 'Order Placed'} · Delivery: {r.get('delivery_date') or '—'}")
+                st.write(f"Quantity: {r.get('quantity') or '—'} · Payment: {r.get('payment_method') or 'COD'}")
+                st.download_button('⬇ Invoice',data=build_invoice_pdf(dict(r)),file_name=f'Rachna_Invoice_{rn}.pdf',mime='application/pdf',key=f'user_prev_pdf_{r["id"]}')
+
+
 def order_page():
-    page_header('ORDER','Place an Order','Payment method, invoice and Amazon-style tracking')
+    page_header('NEW ORDER','New Order','Payment method, invoice and Amazon-style tracking')
     user=current_user()
     if not user: st.warning('Please login first.'); return
     items=products()
@@ -1336,6 +1406,26 @@ def init_db_cached():
     ensure_auth_schema()
     return True
 
+
+NAV_LABELS = {
+    'Home':'Rachna Hub',
+    'Gallery':'Collections',
+    'Order':'New Order',
+    'Account':'My Space',
+    'Order History':'Order History',
+    'Order Details':'Order History',
+    'Emails':'Communications',
+    'About':'About Rachna',
+    'Contact Us':'Get In Touch',
+    'Master Gallery':'Rachna Collections',
+    'Master Account':'Account Center',
+    'Admin Master':'Admin Console',
+    'Track Order':'Track Order',
+    'Login':'Login',
+}
+
+def nav_label(page):
+    return NAV_LABELS.get(page, page)
 
 def main():
     try:
@@ -1370,13 +1460,14 @@ def main():
         if st.session_state.admin:
             nav=['Home','Gallery','Order','Account','Order Details','Emails','About','Contact Us','Master Gallery','Master Account','Admin Master']
         elif st.session_state.user_id:
-            nav=['Home','Gallery','Order','Order History','Account','About','Contact Us']
+            nav=['Home','Gallery','Order','Track Order','Order History','Account','About','Contact Us']
         else:
             nav=['Login']
         if st.session_state.user_id and not st.session_state.admin:
-            visible=public_page_names(); nav=[x for x in nav if x in visible or x=='Login']
+            visible=public_page_names(); nav=[x for x in nav if x in visible or x in ('Login','Track Order','Order History')]
         for p in nav:
-            if st.button(p,key='nav_'+p,use_container_width=True,type='primary' if st.session_state.page==p else 'secondary'):
+            label=nav_label(p)
+            if st.button(label,key='nav_'+p,use_container_width=True,type='primary' if st.session_state.page==p else 'secondary'):
                 st.session_state.page=p
                 st.session_state._consumed_page_qp=p
                 st.rerun()
@@ -1408,14 +1499,14 @@ def main():
     elif p=='Master Gallery': gallery(True)
     elif p=='Order': order_page()
     elif p=='Order History': user_order_history()
-    elif p=='Track Order': public_track_page()
+    elif p=='Track Order': user_track_order_page() if st.session_state.user_id else public_track_page()
     elif p=='Order Details': admin_orders_page()
     elif p=='Emails': emails_page()
     elif p=='Account': account(False)
     elif p=='Master Account': account(True)
     elif p=='Admin Master': site_admin_page()
     elif p=='About':
-        page_header('OUR STORY','About RACHNA PLYWOOD & HARDWARE','Thoughtful materials. Reliable workmanship.')
+        page_header('OUR STORY','About Rachna','Thoughtful materials. Reliable workmanship.')
         st.markdown(f'<div class="hero"><div class="brand-sub">PLAYWOOD · FURNITURE · HARDWARE</div><h2>{APP_NAME}</h2><p>A digital catalogue to showcase furniture, plywood and hardware products.</p></div>',unsafe_allow_html=True)
         rows=about_marquee_rows()
         if not rows:
@@ -1427,7 +1518,7 @@ def main():
             st.markdown(markup+'</div>',unsafe_allow_html=True)
         a,b,c=st.columns(3); a.markdown('### 🪵 Furniture\nMade-to-order furniture.'); b.markdown('### 🧰 Hardware\nFittings and hardware products.'); c.markdown('### 📐 Materials\nPlywood, sizes and colours.')
     elif p=='Contact Us':
-        page_header('GET IN TOUCH','Contact Us','Contact details will be added when provided.'); st.markdown('<div class="hero"><h2>We would love to hear from you.</h2><p>Contact information coming soon.</p></div>',unsafe_allow_html=True)
+        page_header('GET IN TOUCH','Get In Touch','Contact details will be added when provided.'); st.markdown('<div class="hero"><h2>We would love to hear from you.</h2><p>Contact information coming soon.</p></div>',unsafe_allow_html=True)
 
 # st.markdown('<div style="margin-top:2rem;padding:1rem 0;border-top:1px solid #d6ae5255;text-align:center;color:#aab6c5;font-size:.8rem">© RACHNA PLAYWOO &amp; HARDWEAR · All rights reserved</div>', unsafe_allow_html=True)
 
