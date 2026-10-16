@@ -5,7 +5,7 @@ RACHNA PLAYWOO & HARDWEAR — Streamlit catalogue and workshop accounts.
 Configure credentials in Streamlit Secrets; never hard-code database credentials.
 Creates separate rachna_* tables in the configured PostgreSQL database and does not modify the existing tiffin table.
 """
-import io, os, hmac, base64, html, hashlib, smtplib, ssl, json, mimetypes
+import io, os, hmac, base64, html, hashlib, smtplib, ssl, json, mimetypes, secrets
 from datetime import date, timedelta, datetime
 import streamlit as st
 import psycopg2
@@ -139,6 +139,8 @@ def init_db():
     """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'Pending'""",
     """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS order_status TEXT DEFAULT 'Order Placed'""",
     """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()""",
+    """ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS tracking_token TEXT""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS uq_rachna_order_tracking_token ON rachna_orders(tracking_token) WHERE tracking_token IS NOT NULL""",
     """CREATE UNIQUE INDEX IF NOT EXISTS uq_rachna_order_number ON rachna_orders(order_number) WHERE order_number IS NOT NULL""",
     """CREATE INDEX IF NOT EXISTS idx_rachna_orders_user ON rachna_orders(user_id,created_at DESC)""",
     """CREATE TABLE IF NOT EXISTS rachna_order_status_history(id BIGSERIAL PRIMARY KEY,order_id BIGINT NOT NULL REFERENCES rachna_orders(id) ON DELETE CASCADE,status TEXT NOT NULL,note TEXT,changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""",
@@ -146,6 +148,11 @@ def init_db():
     """ALTER TABLE rachna_staff ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#3b82f6'""",
     """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS pincode TEXT""",
     """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS staff_id BIGINT REFERENCES rachna_staff(id) ON DELETE SET NULL""",
+    """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_hash TEXT""",
+    """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ""",
+    """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_attempts INTEGER NOT NULL DEFAULT 0""",
+    """ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE""",
+    """UPDATE rachna_users SET email_verified=TRUE WHERE email_verified=FALSE AND COALESCE(password_hash,'') <> ''""",
     """CREATE INDEX IF NOT EXISTS idx_rachna_users_email ON rachna_users(email)""",
     """CREATE INDEX IF NOT EXISTS idx_rachna_orders_date ON rachna_orders(created_at DESC)""",
     "INSERT INTO rachna_page_config(page_name,visible) VALUES ('Home',TRUE),('Gallery',TRUE),('Order',TRUE),('Account',TRUE),('About',TRUE),('Contact Us',TRUE) ON CONFLICT(page_name) DO NOTHING""" ]
@@ -161,6 +168,50 @@ def money(v):
 
 def password_hash(value):
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+def make_otp():
+    return f"{secrets.randbelow(900000) + 100000:06d}"
+
+def send_registration_otp(email, name, otp):
+    host = cfg("SMTP_HOST", "smtp.gmail.com")
+    port = int(cfg("SMTP_PORT", "587"))
+    user = cfg("SMTP_USER") or cfg("SMTP_USERNAME") or cfg("SMTP_EMAIL")
+    pw = cfg("SMTP_PASSWORD")
+    from_name = cfg("SMTP_FROM_NAME", APP_NAME)
+    if not user or not pw:
+        return False, "SMTP_USER/SMTP_PASSWORD are not configured."
+    msg = EmailMessage()
+    msg["Subject"] = f"{APP_NAME} — Email Verification OTP"
+    msg["From"] = f"{from_name} <{user}>"
+    msg["To"] = email
+    text = (f"Hello {name},\n\nYour Rachna registration verification code is: {otp}\n\n"
+            "This OTP is valid for 5 minutes and can be used only once.\n"
+            "If you did not request this, you can ignore this email.\n\n"
+            f"{APP_NAME}")
+    html_body = f"""<div style="font-family:Arial,sans-serif;background:#f3f0e8;padding:24px">
+      <div style="max-width:560px;margin:auto;background:#071b33;border-radius:18px;overflow:hidden;border:1px solid #d6ae52">
+        <div style="padding:28px;text-align:center">
+          <div style="color:#d6ae52;font-size:13px;letter-spacing:2px;font-weight:700">{html.escape(APP_NAME)}</div>
+          <h2 style="color:white;margin:14px 0 8px">Verify your email</h2>
+          <p style="color:#dbe4ef">Hello {html.escape(name)}, use this 6-digit OTP to complete registration.</p>
+          <div style="display:inline-block;background:white;color:#071b33;font-size:32px;font-weight:800;letter-spacing:9px;padding:16px 22px;border-radius:14px;margin:14px 0">{otp}</div>
+          <p style="color:#b8c4d2;font-size:13px">Valid for 5 minutes · One-time use</p>
+        </div>
+      </div>
+    </div>"""
+    msg.set_content(text)
+    msg.add_alternative(html_body, subtype="html")
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=15) as smtp:
+                smtp.login(user, pw); smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as smtp:
+                smtp.ehlo(); smtp.starttls(context=ssl.create_default_context()); smtp.ehlo()
+                smtp.login(user, pw); smtp.send_message(msg)
+        return True, "OTP email sent."
+    except Exception as e:
+        return False, f"OTP email failed: {type(e).__name__}: {e}"
 
 
 def admin_credentials():
@@ -178,7 +229,7 @@ def password_ok(user_id, entered):
     return hmac.compare_digest(str(user_id), str(aid)) and hmac.compare_digest(str(entered), str(apw))
 
 
-PAGE_NAMES = ["Home", "Gallery", "Order", "Account", "Order Details", "Master Gallery", "Master Account", "About", "Contact Us", "Login", "Admin Master"]
+PAGE_NAMES = ["Home", "Gallery", "Order", "Account", "Order History", "Order Details", "Track Order", "Master Gallery", "Master Account", "About", "Contact Us", "Login", "Admin Master"]
 SETTING_KEYS = {
     "App logo": "app_logo",
     **{f"{page} background": f"bg_{page.lower().replace(' ', '_')}" for page in PAGE_NAMES},
@@ -565,12 +616,42 @@ def status_index(status):
     except ValueError: return 0
 
 def tracking_html(status):
-    steps=order_status_steps(); current=status_index(status); cells=[]
+    """Email-safe tracking bar. Five equal segments prevent the old bar overflow."""
+    steps=order_status_steps(); current=status_index(status)
+    circles=[]; labels=[]; bars=[]
     for i,step in enumerate(steps):
-        done=i<=current; bg="#16a34a" if done else "#cbd5e1"; fg="#166534" if done else "#64748b"
-        cells.append(f'<td width="20%" align="center" style="font-size:10px;color:{fg};font-weight:700"><div style="width:24px;height:24px;border-radius:50%;background:{bg};color:white;line-height:24px;margin:auto">{"✓" if done else i+1}</div><div style="margin-top:6px">{html.escape(step)}</div></td>')
-    width=max(5,current*25+12.5)
-    return '<table width="100%"><tr>'+''.join(cells)+'</tr><tr><td colspan="5"><div style="height:6px;background:#e5e7eb;border-radius:8px"><div style="height:6px;background:#16a34a;border-radius:8px;width:'+str(width)+'%"></div></div></td></tr></table>'
+        done=i<=current
+        bg="#16a34a" if done else "#cbd5e1"
+        fg="#166534" if done else "#64748b"
+        circles.append(f'<td width="20%" align="center" style="padding:0 2px"><div style="width:24px;height:24px;border-radius:50%;background:{bg};color:white;line-height:24px;margin:auto;text-align:center;font-weight:700">{"✓" if done else i+1}</div></td>')
+        labels.append(f'<td width="20%" align="center" valign="top" style="padding:5px 2px 0;font-size:10px;line-height:13px;color:{fg};font-weight:700">{html.escape(step)}</td>')
+        bars.append(f'<td width="20%" style="padding:0 1px"><div style="height:6px;background:{bg};border-radius:8px;width:100%"></div></td>')
+    return (
+        '<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="table-layout:fixed">'
+        '<tr>'+''.join(circles)+'</tr>'
+        '<tr style="height:8px">'+''.join(bars)+'</tr>'
+        '<tr>'+''.join(labels)+'</tr>'
+        '</table>'
+    )
+
+def app_base_url():
+    configured=str(cfg("APP_URL") or "").strip().rstrip("/")
+    return configured
+
+def tracking_url(order):
+    token=str(order.get("tracking_token") or "").strip()
+    base=app_base_url()
+    if token and base:
+        return f"{base}/?track={token}"
+    return ""
+
+def ensure_tracking_token(order_id):
+    rows=query("SELECT tracking_token FROM rachna_orders WHERE id=%s",(order_id,))
+    if rows and rows[0].get("tracking_token"):
+        return str(rows[0]["tracking_token"])
+    token=secrets.token_urlsafe(24)
+    query("UPDATE rachna_orders SET tracking_token=%s WHERE id=%s",(token,order_id),fetch=False)
+    return token
 
 def build_invoice_pdf(order):
     buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=A4,rightMargin=36,leftMargin=36,topMargin=36,bottomMargin=36)
@@ -590,6 +671,7 @@ def send_order_email(order, debug=False, event_title="Order Confirmation"):
     host=cfg('SMTP_HOST'); user=cfg('SMTP_USER', cfg('SMTP_USERNAME', cfg('SMTP_EMAIL'))); pw=cfg('SMTP_PASSWORD')
     customer_email=str(order.get('customer_email') or '').strip()
     admin_email=str(cfg('ADMIN_EMAIL') or cfg('ORDER_EMAIL') or cfg('SMTP_TO') or '').strip()
+    from_name=str(cfg('SMTP_FROM_NAME') or APP_NAME).strip()
     port_raw=cfg('SMTP_PORT','465')
     log('Step 1/7: Reading SMTP secrets and order recipient')
     log(f'SMTP_HOST present: {bool(host)}'); log(f'SMTP_USER/USERNAME/EMAIL present: {bool(user)}'); log(f'SMTP_PASSWORD present: {bool(pw)}')
@@ -625,10 +707,15 @@ def send_order_email(order, debug=False, event_title="Order Confirmation"):
     except Exception as e:
         log(f'Logo lookup warning: {type(e).__name__}: {e}')
     logo_html=('<img src="cid:rachna_logo" alt="Rachna Playwood & Hardwear" style="max-height:76px;max-width:240px;display:block;margin:0 auto 12px;object-fit:contain;">' if logo_bytes else (f'<img src="{html.escape(logo_url, quote=True)}" alt="Rachna Playwood & Hardwear" style="max-height:76px;max-width:240px;display:block;margin:0 auto 12px;object-fit:contain;">' if logo_url else '<div style="font-size:28px;font-weight:800;letter-spacing:1px;">RACHNA PLAYWOOD &amp; HARDWEAR</div>'))
+    if not order.get('tracking_token'):
+        try: order['tracking_token']=ensure_tracking_token(order.get('id'))
+        except Exception as te: log(f'Tracking token warning: {type(te).__name__}: {te}')
+    live_track=tracking_url(order)
+    track_block=(f'<div style="margin-top:18px;text-align:center"><a href="{html.escape(live_track,quote=True)}" style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;font-weight:800;padding:12px 20px;border-radius:10px">View live order status</a><div style="font-size:11px;color:#777;margin-top:7px">Status changes appear here automatically. No new email is sent for every status change.</div></div>' if live_track else '<div style="margin-top:18px;text-align:center;font-size:12px;color:#777">Add APP_URL in Streamlit Secrets to enable live tracking from this email.</div>')
     customer=html.escape(str(order.get('customer_name') or '')); phone=html.escape(str(order.get('phone') or '')); address=html.escape(str(order.get('address') or '—')); delivery=html.escape(str(order.get('delivery_date') or '')); category=html.escape(str(order.get('category') or '')); product_name=html.escape(str(order.get('product_name') or '')); quantity=html.escape(str(order.get('quantity') or '')); unit_price=html.escape(money(order.get('unit_price'))); total=html.escape(money(order.get('total_price')))
-    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:700;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div><div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">Order received</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">Your order has been successfully placed.</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div></td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">RACHNA PLAYWOOD &amp; HARDWEAR</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
-    text_body=(f"RACHNA PLAYWOOD & HARDWEAR - Order Confirmation\n\nThank you, {order.get('customer_name') or ''}!\n\nProduct: {order.get('product_name') or ''}\nCategory: {order.get('category') or ''}\nQuantity: {order.get('quantity') or ''}\nUnit price: {money(order.get('unit_price'))}\nTotal: {money(order.get('total_price'))}\n\nPhone: {order.get('phone') or ''}\nDelivery date: {order.get('delivery_date') or ''}\nAddress: {order.get('address') or ''}\n")
-    email_msg=EmailMessage(); email_msg['Subject']=f"Rachna Order #{order.get('order_number') or order.get('id') or ''} — {event_title}"; email_msg['From']=user; email_msg['To']=customer_email
+    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:700;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div><div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">Order received</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">Your order has been successfully placed.</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div>{track_block}</td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">RACHNA PLAYWOOD &amp; HARDWEAR</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
+    text_body=(f"RACHNA PLAYWOOD & HARDWEAR - Order Confirmation\n\nThank you, {order.get('customer_name') or ''}!\n\nProduct: {order.get('product_name') or ''}\nCategory: {order.get('category') or ''}\nQuantity: {order.get('quantity') or ''}\nUnit price: {money(order.get('unit_price'))}\nTotal: {money(order.get('total_price'))}\n\nPhone: {order.get('phone') or ''}\nDelivery date: {order.get('delivery_date') or ''}\nAddress: {order.get('address') or ''}\n\nLive tracking: {live_track or 'Set APP_URL in Streamlit Secrets to enable it.'}\n")
+    email_msg=EmailMessage(); email_msg['Subject']=f"Rachna Order #{order.get('order_number') or order.get('id') or ''} — {event_title}"; email_msg['From']=f'{from_name} <{user}>'; email_msg['To']=customer_email
     if admin_email and admin_email.lower()!=customer_email.lower(): email_msg['Cc']=admin_email
     email_msg.set_content(text_body)
     email_msg.add_alternative(html_body,subtype='html')
@@ -678,39 +765,106 @@ def page_header(kicker,title,subtitle=""):
     if subtitle: st.markdown(f'<div style="text-align:center;color:#cbd5e1;margin:.2rem 0 1rem">{html.escape(subtitle)}</div>',unsafe_allow_html=True)
 
 
-def login_page():
-    if st.session_state.get("user_id") or st.session_state.get("admin"):
-        st.info("You are already signed in.")
-        if st.button("Continue to Home", type="primary"):
-            st.session_state.page="Home"; st.rerun()
+def _complete_pin_setup(user_id):
+    user = find_user_by_id(user_id)
+    if not user:
+        st.session_state.pop("pin_setup_user_id", None)
         return
-    page_header("WELCOME","Sign in to Rachna","Admin and normal user access")
-    tabs=st.tabs(["Sign in","Create account"])
+    st.markdown("""
+    <div style="max-width:520px;margin:1.5rem auto;padding:26px;border:2px solid #d6ae52;
+         border-radius:22px;background:linear-gradient(145deg,#071b33,#102c50);text-align:center;
+         box-shadow:0 18px 50px rgba(0,0,0,.28)">
+      <div style="font-size:36px">🔐</div>
+      <h2 style="margin:4px 0;color:#d6ae52!important">Set your 4-digit PIN</h2>
+      <p style="color:#dbe4ef;margin:0">Your email is verified. Create a PIN for future sign in.</p>
+    </div>""", unsafe_allow_html=True)
+    with st.form("mandatory_pin_setup"):
+        pin1 = st.text_input("4-digit PIN", type="password", max_chars=4, placeholder="••••")
+        pin2 = st.text_input("Confirm PIN", type="password", max_chars=4, placeholder="••••")
+        save_pin = st.form_submit_button("Save PIN & Continue", type="primary", use_container_width=True)
+    if save_pin:
+        if not (pin1.isdigit() and len(pin1) == 4):
+            st.error("PIN must contain exactly 4 digits."); return
+        if pin1 != pin2:
+            st.error("PIN and Confirm PIN do not match."); return
+        query("UPDATE rachna_users SET password_hash=%s,updated_at=NOW() WHERE id=%s", (password_hash(pin1), user_id), fetch=False)
+        st.session_state.user_id = int(user_id); st.session_state.admin = False; st.session_state.page = "Home"
+        st.session_state.pop("pin_setup_user_id", None)
+        st.success("PIN saved. Welcome to Rachna!"); st.rerun()
+
+
+def login_page():
+    pin_user = st.session_state.get("pin_setup_user_id")
+    if pin_user:
+        _complete_pin_setup(int(pin_user)); return
+    page_header("WELCOME", "Sign in to Rachna", "Email + 4-digit PIN")
+    tabs = st.tabs(["Sign in", "Create account"])
     with tabs[0]:
         with st.form("login"):
-            uid=st.text_input("Email / User ID")
-            pw=st.text_input("Password / 4-digit PIN",type="password")
-            submit=st.form_submit_button("Sign in",type="primary",use_container_width=True)
+            uid = st.text_input("Email / Phone")
+            pin = st.text_input("4-digit PIN / existing password", type="password", max_chars=64)
+            submit = st.form_submit_button("Sign in", type="primary", use_container_width=True)
         if submit:
-            if password_ok(uid,pw):
+            if password_ok(uid, pin):
                 st.session_state.admin=True; st.session_state.user_id=None; st.session_state.page="Home"; st.rerun()
             else:
-                rows=query("SELECT id,name,password_hash FROM rachna_users WHERE (email=%s OR phone=%s) AND active=TRUE LIMIT 1",(uid,uid))
-                if rows and hmac.compare_digest(password_hash(pw),str(rows[0]["password_hash"])):
+                rows=query("SELECT id,password_hash,is_admin,email_verified FROM rachna_users WHERE (email=%s OR phone=%s) AND active=TRUE LIMIT 1", (uid.strip().lower(),uid.strip()))
+                if not rows: st.error("Account not found. Please create an account first.")
+                elif not bool(rows[0].get("email_verified")): st.warning("Your email is not verified. Please register again.")
+                elif len(pin)!=4 or not pin.isdigit() or not rows[0].get("password_hash"): st.error("Enter your 4-digit PIN.")
+                elif hmac.compare_digest(password_hash(pin),str(rows[0]["password_hash"])):
                     st.session_state.user_id=int(rows[0]["id"]); st.session_state.admin=bool(rows[0].get("is_admin")); st.session_state.page="Home"; st.rerun()
-                else: st.error("Incorrect ID or password.")
+                else: st.error("Incorrect email/phone or PIN.")
     with tabs[1]:
-        with st.form("signup",clear_on_submit=False):
-            name=st.text_input("Name *"); phone=st.text_input("Phone *"); email=st.text_input("Email *"); age=st.number_input("Age",min_value=1,max_value=120,value=18); address=st.text_area("Address"); pin=st.text_input("Pincode",max_chars=6); dp=st.file_uploader("Profile photo (optional)",type=["jpg","jpeg","png","webp"]); password=st.text_input("Password / 4-digit PIN *",type="password",max_chars=64); create=st.form_submit_button("Create account",type="primary",use_container_width=True)
-        if create:
-            if not name.strip() or not phone.strip() or not email.strip() or not password.strip(): st.error("Name, phone, email and password are required.")
-            elif len(password)==4 and not password.isdigit(): st.error("If using a 4-digit PIN, all 4 characters must be digits.")
-            else:
-                try:
-                    row=query("INSERT INTO rachna_users(name,phone,email,age,address,pincode,password_hash) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id",(name.strip(),phone.strip(),email.strip().lower(),int(age),address.strip(),pin.strip(),password_hash(password)))[0]
-                    if dp: save_user_dp(dp,row["id"])
-                    st.session_state.user_id=int(row["id"]); st.session_state.admin=False; st.session_state.page="Home"; st.success("Account created."); st.rerun()
-                except Exception as e: st.error(f"Could not create account: {e}")
+        pending=st.session_state.get("registration_pending")
+        if not pending:
+            with st.form("signup_start",clear_on_submit=False):
+                name=st.text_input("Name *"); email=st.text_input("Email *"); phone=st.text_input("Phone *")
+                start=st.form_submit_button("Send 6-digit OTP",type="primary",use_container_width=True)
+            if start:
+                name=name.strip(); email=email.strip().lower(); phone=phone.strip()
+                if not name or not email or not phone: st.error("Name, email and phone are required.")
+                elif "@" not in email: st.error("Enter a valid email address.")
+                elif query("SELECT id FROM rachna_users WHERE lower(email)=lower(%s) OR phone=%s LIMIT 1",(email,phone)):
+                    st.error("This email or phone is already registered. Please sign in.")
+                else:
+                    otp=make_otp(); ok,msg=send_registration_otp(email,name,otp)
+                    if ok:
+                        st.session_state.registration_pending={"name":name,"email":email,"phone":phone,"otp_hash":password_hash(otp),"otp_expires_at":(datetime.now()+timedelta(minutes=5)).isoformat(),"otp_attempts":0}
+                        st.success("6-digit OTP sent to your email."); st.rerun()
+                    else: st.error(msg)
+        else:
+            st.markdown(f"<div class='profile-card'><h3>Verify your email</h3><p>OTP sent to <b>{html.escape(pending['email'])}</b></p></div>",unsafe_allow_html=True)
+            with st.form("signup_verify",clear_on_submit=False):
+                otp_entered=st.text_input("6-digit OTP",max_chars=6,placeholder="123456")
+                verify=st.form_submit_button("Verify OTP & Create Account",type="primary",use_container_width=True)
+            a,b=st.columns(2)
+            with a:
+                if st.button("Resend OTP",use_container_width=True):
+                    if pending.get("otp_attempts",0)>=5: st.error("Too many OTP attempts. Please cancel and restart registration.")
+                    else:
+                        otp=make_otp(); ok,msg=send_registration_otp(pending["email"],pending["name"],otp)
+                        if ok:
+                            pending["otp_hash"]=password_hash(otp); pending["otp_expires_at"]=(datetime.now()+timedelta(minutes=5)).isoformat(); pending["otp_attempts"]=0
+                            st.session_state.registration_pending=pending; st.success("New OTP sent."); st.rerun()
+                        else: st.error(msg)
+            with b:
+                if st.button("Cancel",use_container_width=True): st.session_state.pop("registration_pending",None); st.rerun()
+            if verify:
+                if not otp_entered.isdigit() or len(otp_entered)!=6: st.error("Enter the 6-digit OTP.")
+                else:
+                    try: expiry=datetime.fromisoformat(pending["otp_expires_at"])
+                    except Exception: expiry=datetime.min
+                    if datetime.now()>expiry: st.error("OTP expired. Please resend OTP.")
+                    elif pending.get("otp_attempts",0)>=5: st.error("Too many OTP attempts. Please cancel and restart registration.")
+                    elif not hmac.compare_digest(password_hash(otp_entered),pending["otp_hash"]):
+                        pending["otp_attempts"]=int(pending.get("otp_attempts",0))+1; st.session_state.registration_pending=pending; st.error("Incorrect OTP.")
+                    else:
+                        try:
+                            row=query("INSERT INTO rachna_users(name,phone,email,password_hash,email_verified,updated_at) VALUES(%s,%s,%s,%s,TRUE,NOW()) RETURNING id",(pending["name"],pending["phone"],pending["email"],""))[0]
+                            st.session_state.pop("registration_pending",None); st.session_state.pin_setup_user_id=int(row["id"]); st.success("Email verified and account created. Set your 4-digit PIN below."); st.rerun()
+                        except Exception as e: st.error(f"Could not create account: {e}")
+
 
 @st.cache_data(ttl=30, show_spinner=False)
 def products(active=True):
@@ -896,7 +1050,9 @@ def find_user_staff(staff_id):
 
 
 def ensure_orders_table():
-    query("CREATE TABLE IF NOT EXISTS rachna_orders(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES rachna_users(id) ON DELETE SET NULL,customer_name TEXT NOT NULL,phone TEXT NOT NULL,address TEXT,delivery_date DATE NOT NULL,product_id BIGINT REFERENCES rachna_products(id) ON DELETE SET NULL,category TEXT,product_name TEXT NOT NULL,quantity NUMERIC(12,2) NOT NULL CHECK(quantity>0),unit_price NUMERIC(12,2),total_price NUMERIC(12,2),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),order_number TEXT,customer_email TEXT,payment_method TEXT DEFAULT 'COD',payment_status TEXT DEFAULT 'Pending',order_status TEXT DEFAULT 'Order Placed',updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",fetch=False)
+    query("CREATE TABLE IF NOT EXISTS rachna_orders(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES rachna_users(id) ON DELETE SET NULL,customer_name TEXT NOT NULL,phone TEXT NOT NULL,address TEXT,delivery_date DATE NOT NULL,product_id BIGINT REFERENCES rachna_products(id) ON DELETE SET NULL,category TEXT,product_name TEXT NOT NULL,quantity NUMERIC(12,2) NOT NULL CHECK(quantity>0),unit_price NUMERIC(12,2),total_price NUMERIC(12,2),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),order_number TEXT,customer_email TEXT,payment_method TEXT DEFAULT 'COD',payment_status TEXT DEFAULT 'Pending',order_status TEXT DEFAULT 'Order Placed',updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),tracking_token TEXT)",fetch=False)
+    query("ALTER TABLE rachna_orders ADD COLUMN IF NOT EXISTS tracking_token TEXT",fetch=False)
+    query("CREATE UNIQUE INDEX IF NOT EXISTS uq_rachna_order_tracking_token ON rachna_orders(tracking_token) WHERE tracking_token IS NOT NULL",fetch=False)
     query("CREATE TABLE IF NOT EXISTS rachna_order_status_history(id BIGSERIAL PRIMARY KEY,order_id BIGINT NOT NULL REFERENCES rachna_orders(id) ON DELETE CASCADE,status TEXT NOT NULL,note TEXT,changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",fetch=False)
 
 def user_order_history():
@@ -906,14 +1062,25 @@ def user_order_history():
     if not rows: st.info('No orders yet.'); return
     for r in rows:
         with st.container(border=True):
-            st.markdown(f"**#{r.get('order_number') or r['id']}** · {html.escape(str(r['product_name']))} · **{money(r.get('total_price'))}**")
+            no=r.get('order_number') or r['id']
+            st.markdown(f"**#{no}** · {html.escape(str(r['product_name']))} · **{money(r.get('total_price'))}**")
+            st.caption(f"Status: {r.get('order_status') or 'Order Placed'} · Payment: {r.get('payment_method') or 'COD'} / {r.get('payment_status') or 'Pending'}")
             st.markdown(tracking_html(str(r.get('order_status') or 'Order Placed')),unsafe_allow_html=True)
-            for h in query('SELECT status,note,changed_at FROM rachna_order_status_history WHERE order_id=%s ORDER BY changed_at',(r['id'],)): st.caption(f"✓ {h['status']} · {h['changed_at']} · {h.get('note') or ''}")
-            st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(r)),file_name=f"Rachna_Invoice_{r.get('order_number') or r['id']}.pdf",mime='application/pdf',key=f'uhpdf_{r["id"]}')
+            for h in query('SELECT status,note,changed_at FROM rachna_order_status_history WHERE order_id=%s ORDER BY changed_at',(r['id'],)):
+                st.caption(f"✓ {h['status']} · {h['changed_at']} · {h.get('note') or ''}")
+            c1,c2=st.columns(2)
+            with c1:
+                st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(r)),file_name=f'Rachna_Invoice_{no}.pdf',mime='application/pdf',key=f'uhpdf_{r["id"]}')
+            with c2:
+                if st.button('🗑 Delete this order',key=f'uhdel_{r["id"]}'):
+                    query('DELETE FROM rachna_orders WHERE id=%s AND user_id=%s',(r['id'],u['id']),fetch=False)
+                    st.success('Order deleted from your Order History.')
+                    st.rerun()
+
 
 def admin_orders_page():
     if not st.session_state.get('admin'): st.warning('Admin login required.'); return
-    page_header('ORDER CONTROL','Order Details','Admin order management and customer notifications')
+    page_header('ORDER CONTROL','Order Details','Admin order management · live tracking · delete controls')
     rows=query('SELECT * FROM rachna_orders ORDER BY created_at DESC LIMIT 1000')
     if not rows: st.info('No orders found.'); return
     statuses=order_status_steps()
@@ -927,13 +1094,44 @@ def admin_orders_page():
             cur=str(r.get('order_status') or 'Order Placed'); ns=st.selectbox('Order status',statuses,index=status_index(cur),key=f'os_{r["id"]}')
             opts=['Pending','Paid','Failed','Refunded']; cps=str(r.get('payment_status') or 'Pending'); ps=st.selectbox('Payment status',opts,index=opts.index(cps) if cps in opts else 0,key=f'ps_{r["id"]}')
             note=st.text_input('Tracking note',key=f'on_{r["id"]}')
-            if st.button('Save update & notify customer',type='primary',key=f'order_save_{r["id"]}'):
-                query('UPDATE rachna_orders SET order_status=%s,payment_status=%s,updated_at=NOW() WHERE id=%s',(ns,ps,r['id']),fetch=False)
-                query('INSERT INTO rachna_order_status_history(order_id,status,note) VALUES(%s,%s,%s)',(r['id'],ns,note.strip()),fetch=False)
-                updated=query('SELECT * FROM rachna_orders WHERE id=%s',(r['id'],))[0]
-                ok,msg=send_order_email(dict(updated),event_title=f'Order Update: {ns}')
-                st.success('Order updated and email notification sent.' if ok else 'Order updated, email failed: '+msg); st.rerun()
+            c1,c2=st.columns(2)
+            with c1:
+                if st.button('Save status update',type='primary',key=f'order_save_{r["id"]}'):
+                    query('UPDATE rachna_orders SET order_status=%s,payment_status=%s,updated_at=NOW() WHERE id=%s',(ns,ps,r['id']),fetch=False)
+                    if ns != cur or ps != cps or note.strip():
+                        query('INSERT INTO rachna_order_status_history(order_id,status,note) VALUES(%s,%s,%s)',(r['id'],ns,note.strip()),fetch=False)
+                    st.success('Status updated. Customer can see the new status from the same original email tracking link. No new email was sent.')
+                    st.rerun()
+            with c2:
+                if st.button('🗑 Delete order',key=f'order_del_{r["id"]}'):
+                    query('DELETE FROM rachna_orders WHERE id=%s',(r['id'],),fetch=False)
+                    st.success(f'Order #{no} deleted.')
+                    st.rerun()
             st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(r)),file_name=f'Rachna_Invoice_{no}.pdf',mime='application/pdf',key=f'ahpdf_{r["id"]}')
+
+
+def public_track_page():
+    page_header('LIVE TRACKING','Track Your Order','The status below is read live from the order database.')
+    token=str(st.query_params.get('track') or '').strip()
+    if not token:
+        st.info('Tracking link is missing or invalid.')
+        return
+    rows=query('SELECT * FROM rachna_orders WHERE tracking_token=%s LIMIT 1',(token,))
+    if not rows:
+        st.error('This tracking link is invalid or the order has been deleted.')
+        return
+    r=rows[0]
+    st.markdown(f"<div class='hero'><h2>Order #{html.escape(str(r.get('order_number') or r['id']))}</h2><p>{html.escape(str(r.get('product_name') or ''))} · {money(r.get('total_price'))}</p></div>",unsafe_allow_html=True)
+    st.markdown(tracking_html(str(r.get('order_status') or 'Order Placed')),unsafe_allow_html=True)
+    st.success(f"Current status: {r.get('order_status') or 'Order Placed'}")
+    st.write(f"Customer: {r.get('customer_name') or ''}")
+    st.write(f"Delivery date: {r.get('delivery_date') or ''}")
+    history=query('SELECT status,note,changed_at FROM rachna_order_status_history WHERE order_id=%s ORDER BY changed_at',(r['id'],))
+    if history:
+        st.subheader('Tracking history')
+        for h in history:
+            st.markdown(f"**✓ {html.escape(str(h['status']))}** · {html.escape(str(h['changed_at']))}  \n{html.escape(str(h.get('note') or ''))}")
+    st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(r)),file_name=f"Rachna_Invoice_{r.get('order_number') or r['id']}.pdf",mime='application/pdf',key=f'trackpdf_{r["id"]}')
 
 def order_page():
     page_header('ORDER','Place an Order','Payment method, invoice and Amazon-style tracking')
@@ -949,7 +1147,8 @@ def order_page():
         if not name.strip() or not phone.strip() or not address.strip(): st.error('Name, phone and delivery address are required.'); return
         if payment!='COD': st.info('Payment method saved as Pending. Actual UPI/card collection requires a payment-gateway integration.')
         ensure_orders_table(); no='RCH'+datetime.now().strftime('%Y%m%d%H%M%S')+str(user['id']).zfill(3)
-        row=query('''INSERT INTO rachna_orders(user_id,customer_name,phone,address,delivery_date,product_id,category,product_name,quantity,unit_price,total_price,order_number,customer_email,payment_method,payment_status,order_status,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()) RETURNING *''',(user['id'],name.strip(),phone.strip(),address.strip(),delivery,product['id'],product['category'],product['title'],qty,product.get('price'),total,no,str(user.get('email') or '').strip(),payment,'Pending','Order Placed'))[0]
+        token=secrets.token_urlsafe(24)
+        row=query('''INSERT INTO rachna_orders(user_id,customer_name,phone,address,delivery_date,product_id,category,product_name,quantity,unit_price,total_price,order_number,customer_email,payment_method,payment_status,order_status,updated_at,tracking_token) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s) RETURNING *''',(user['id'],name.strip(),phone.strip(),address.strip(),delivery,product['id'],product['category'],product['title'],qty,product.get('price'),total,no,str(user.get('email') or '').strip(),payment,'Pending','Order Placed',token))[0]
         query('INSERT INTO rachna_order_status_history(order_id,status,note) VALUES(%s,%s,%s)',(row['id'],'Order Placed','Order created by customer'),fetch=False)
         ok,msg=send_order_email(dict(row),event_title='Order Placed')
         st.success(f'Order #{no} placed successfully. '+('Confirmation + invoice sent to your email.' if ok else ''))
@@ -971,13 +1170,16 @@ def main():
     if 'admin' not in st.session_state: st.session_state.admin=False
     if 'user_id' not in st.session_state: st.session_state.user_id=None
     if 'page' not in st.session_state: st.session_state.page='Login'
+    track_q=str(st.query_params.get('track') or '').strip()
+    if track_q:
+        st.session_state.page='Track Order'
     # Sidebar visibility is controlled by Streamlit's native, accessible hamburger toggle.
     if st.session_state.user_id and not st.session_state.admin:
         u=current_user(); dp=u.get('dp_url') if u else ''
         icon=(f"<img src='{html.escape(dp,quote=True)}' style='width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #d6ae52'>" if dp else "<div style='width:44px;height:44px;border-radius:50%;background:#071b33;border:2px solid #d6ae52;display:flex;align-items:center;justify-content:center;font-size:22px'>👤</div>")
         st.markdown(f"<a href='?page=Account' title='Open profile' style='position:fixed;top:.55rem;right:.75rem;z-index:999999;text-decoration:none'>{icon}</a>",unsafe_allow_html=True)
     qp=st.query_params.get('page')
-    if qp in {'Home','Gallery','Order','Account','Order Details','About','Contact Us','Master Gallery','Master Account','Admin Master','Login'}:
+    if qp in {'Home','Gallery','Order','Order History','Account','Order Details','Track Order','About','Contact Us','Master Gallery','Master Account','Admin Master','Login'}:
         st.session_state.page=qp
     # Keep the sidebar usable while replacing its visible Streamlit header control with the custom button.
     with st.sidebar:
@@ -988,7 +1190,7 @@ def main():
         if st.session_state.admin:
             nav=['Home','Gallery','Order','Account','Order Details','About','Contact Us','Master Gallery','Master Account','Admin Master']
         elif st.session_state.user_id:
-            nav=['Home','Gallery','Order','Account','About','Contact Us']
+            nav=['Home','Gallery','Order','Order History','Account','About','Contact Us']
         else:
             nav=['Login']
         if st.session_state.user_id and not st.session_state.admin:
@@ -1001,9 +1203,9 @@ def main():
             if st.button('Log out',use_container_width=True): st.session_state.admin=False; st.session_state.user_id=None; st.session_state.page='Login'; st.rerun()
         st.caption('© Rachna Playwoo & Hardwear')
     p=st.session_state.page
-    if not st.session_state.admin and p not in ('Login',) and not st.session_state.user_id:
+    if not st.session_state.admin and p not in ('Login','Track Order') and not st.session_state.user_id:
         p='Login'; st.session_state.page='Login'
-    if not st.session_state.admin and p not in ('Login',):
+    if not st.session_state.admin and p not in ('Login','Track Order'):
         try:
             if not page_is_visible(p): st.session_state.page='Home'; p='Home'
         except Exception: pass
@@ -1022,6 +1224,8 @@ def main():
     elif p=='Gallery': gallery(False)
     elif p=='Master Gallery': gallery(True)
     elif p=='Order': order_page()
+    elif p=='Order History': user_order_history()
+    elif p=='Track Order': public_track_page()
     elif p=='Order Details': admin_orders_page()
     elif p=='Account': account(False)
     elif p=='Master Account': account(True)
