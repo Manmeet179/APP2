@@ -168,7 +168,18 @@ def init_db():
     )""",
     """CREATE INDEX IF NOT EXISTS idx_rachna_email_log_created ON rachna_email_log(created_at DESC)""",
     """CREATE INDEX IF NOT EXISTS idx_rachna_orders_date ON rachna_orders(created_at DESC)""",
-    "INSERT INTO rachna_page_config(page_name,visible) VALUES ('Home',TRUE),('Gallery',TRUE),('Order',TRUE),('Account',TRUE),('About',TRUE),('Contact Us',TRUE) ON CONFLICT(page_name) DO NOTHING""" ]
+    "ALTER TABLE rachna_products ADD COLUMN IF NOT EXISTS brand TEXT DEFAULT ''",
+    "ALTER TABLE rachna_products ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE rachna_products ADD COLUMN IF NOT EXISTS featured BOOLEAN NOT NULL DEFAULT FALSE",
+    "CREATE TABLE IF NOT EXISTS rachna_categories(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL UNIQUE,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "CREATE TABLE IF NOT EXISTS rachna_offers(id BIGSERIAL PRIMARY KEY,title TEXT NOT NULL,code TEXT UNIQUE,discount_type TEXT NOT NULL DEFAULT 'Percent',discount_value NUMERIC(12,2) NOT NULL DEFAULT 0,active BOOLEAN NOT NULL DEFAULT TRUE,start_date DATE,end_date DATE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "CREATE TABLE IF NOT EXISTS rachna_addresses(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES rachna_users(id) ON DELETE CASCADE,label TEXT NOT NULL DEFAULT 'Home',address TEXT NOT NULL,pincode TEXT,phone TEXT,is_default BOOLEAN NOT NULL DEFAULT FALSE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "CREATE INDEX IF NOT EXISTS idx_rachna_addresses_user ON rachna_addresses(user_id,created_at DESC)",
+    "CREATE TABLE IF NOT EXISTS rachna_wishlist(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES rachna_users(id) ON DELETE CASCADE,product_id BIGINT NOT NULL REFERENCES rachna_products(id) ON DELETE CASCADE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(user_id,product_id))",
+    "CREATE TABLE IF NOT EXISTS rachna_reviews(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES rachna_users(id) ON DELETE SET NULL,product_id BIGINT NOT NULL REFERENCES rachna_products(id) ON DELETE CASCADE,rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),review TEXT,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "CREATE INDEX IF NOT EXISTS idx_rachna_reviews_product ON rachna_reviews(product_id,created_at DESC)",
+    "INSERT INTO rachna_categories(name) VALUES ('Plywood'),('Hardware'),('Laminate'),('Adhesive'),('Furniture'),('Other') ON CONFLICT(name) DO NOTHING",
+    "INSERT INTO rachna_page_config(page_name,visible) VALUES ('Home',TRUE),('Categories',TRUE),('Featured',TRUE),('Offers',TRUE),('New Arrivals',TRUE),('Gallery',TRUE),('Category Page',TRUE),('Product Details',TRUE),('Search Results',TRUE),('Your Bag',TRUE),('Order',TRUE),('Track Order',TRUE),('Order History',TRUE),('Wishlist',TRUE),('Account',TRUE),('Notifications',TRUE),('Help Center',TRUE),('About',TRUE),('Contact Us',TRUE) ON CONFLICT(page_name) DO NOTHING""" ]
     # Run schema statements independently so one non-critical migration cannot
     # roll back later migrations (important for existing installations).
     for sql in sqls:
@@ -208,6 +219,26 @@ def init_db():
         conn.commit()
     finally:
         conn.close()
+
+@st.cache_resource(show_spinner=False)
+def login_bootstrap_cached():
+    conn=db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS rachna_users(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,phone TEXT NOT NULL UNIQUE,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL DEFAULT '',is_admin BOOLEAN NOT NULL DEFAULT FALSE,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+            for sql in [
+                "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_hash TEXT",
+                "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ",
+                "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_attempts INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+                "CREATE INDEX IF NOT EXISTS idx_rachna_users_email ON rachna_users(email)",
+            ]: cur.execute(sql)
+        conn.commit()
+    finally: conn.close()
+    return True
 
 def ensure_auth_schema():
     """Repair auth columns on every app start, even when Streamlit cache is warm."""
@@ -663,10 +694,15 @@ def site_admin_page():
         except Exception as e: release_upload_lock('lock_save_marquee_images'); st.error(str(e))
     st.subheader('Product image size')
     with st.form('product_size_form'):
-        w=st.slider('Product image width (%)',60,100,int(float(text_setting('product_image_width','100')))); h=st.slider('Product image height (px)',80,300,int(float(text_setting('product_image_height','150')))); save=st.form_submit_button('Save product size',type='primary')
-    if save: save_text_setting('product_image_width',w); save_text_setting('product_image_height',h); st.success('Product size saved.'); st.rerun()
+        c1,c2,c3=st.columns(3)
+        w=c1.slider('Image width (%)',50,100,int(float(text_setting('product_image_width','100'))))
+        h=c2.slider('Desktop image height (px)',80,360,int(float(text_setting('product_image_height','150'))))
+        hm=c3.slider('Mobile image height (px)',60,280,int(float(text_setting('product_image_height_mobile','125'))))
+        save=st.form_submit_button('Save product image size',type='primary',use_container_width=True)
+    if save:
+        save_text_setting('product_image_width',w); save_text_setting('product_image_height',h); save_text_setting('product_image_height_mobile',hm); st.success('Product image display size saved.'); st.rerun()
     st.subheader('Page access / public visibility')
-    public_pages=['Home','Gallery','Order','Your Bag','Track Order','Order History','Account','About','Contact Us']
+    public_pages=['Home','Categories','Featured','Offers','New Arrivals','Gallery','Category Page','Product Details','Search Results','Your Bag','Order','Track Order','Order History','Wishlist','Account','Notifications','Help Center','About','Contact Us']
     for pg in public_pages: query('INSERT INTO rachna_page_config(page_name,visible) VALUES(%s,TRUE) ON CONFLICT(page_name) DO NOTHING',(pg,),fetch=False)
     page_rows=query('SELECT page_name,visible FROM rachna_page_config WHERE page_name=ANY(%s) ORDER BY page_name',(public_pages,))
     with st.form('page_visibility_form'):
@@ -730,6 +766,7 @@ def page_is_visible(page_name):
     return bool(rows and rows[0]["visible"])
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def text_setting(key, default=""):
     rows=query("SELECT text_value FROM rachna_site_settings WHERE setting_key=%s",(key,))
     return str(rows[0]["text_value"] or default) if rows else default
@@ -738,15 +775,15 @@ def text_setting(key, default=""):
 def save_text_setting(key, value):
     query("INSERT INTO rachna_site_settings(setting_key,text_value,updated_at) VALUES(%s,%s,NOW()) ON CONFLICT(setting_key) DO UPDATE SET text_value=EXCLUDED.text_value,updated_at=NOW()",(key,str(value)),fetch=False)
     theme_settings.clear()
+    text_setting.clear()
     get_setting.clear()
 
 
 def product_size_settings():
     try:
-        w=int(float(text_setting("product_image_width","100")))
-        h=int(float(text_setting("product_image_height","150")))
-    except Exception: w,h=100,150
-    return max(60,min(w,100)),max(80,min(h,500))
+        w=int(float(text_setting("product_image_width","100"))); h=int(float(text_setting("product_image_height","150"))); hm=int(float(text_setting("product_image_height_mobile","125")))
+    except Exception: w,h,hm=100,150,125
+    return max(50,min(w,100)),max(80,min(h,500)),max(60,min(hm,350))
 
 
 def find_user_by_id(uid):
@@ -811,8 +848,24 @@ def tracking_html(status):
     )
 
 def app_base_url():
-    configured=str(cfg("APP_URL") or "").strip().rstrip("/")
-    return configured
+    """Return a public app origin for email tracking links.
+
+    APP_URL is preferred because it is stable. If it is not configured,
+    Streamlit's current browser URL is used when available, with query/hash
+    removed. This makes the tracking button work even when APP_URL was forgotten.
+    """
+    configured=str(cfg("APP_URL", "https://rachna-plywood.streamlit.app") or "https://rachna-plywood.streamlit.app").strip().rstrip("/")
+    if configured:
+        return configured
+    try:
+        current=str(getattr(st.context, "url", "") or "").strip()
+        if current:
+            parts=urlsplit(current)
+            if parts.scheme and parts.netloc:
+                return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", "")).rstrip("/")
+    except Exception:
+        pass
+    return ""
 
 def tracking_url(order):
     token=str(order.get("tracking_token") or "").strip()
@@ -917,12 +970,12 @@ def send_order_email(order, debug=False, event_title="Order Confirmation", send=
         try: order['tracking_token']=ensure_tracking_token(order.get('id'))
         except Exception as te: log(f'Tracking token warning: {type(te).__name__}: {te}')
     live_track=tracking_url(order)
-    track_block=(f'<div style="margin-top:18px;text-align:center"><a href="{html.escape(live_track,quote=True)}" style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;font-weight:800;padding:12px 20px;border-radius:10px">View live order status</a><div style="font-size:11px;color:#777;margin-top:7px">Status changes appear here automatically. This is your live order tracking page.</div></div>' if live_track else '<div style="margin-top:18px;text-align:center;font-size:12px;color:#777">Add APP_URL in Streamlit Secrets to enable live tracking from this email.</div>')
+    track_block=(f'<div style="margin:18px 0;padding:16px;background:#071b33;border-radius:14px;text-align:center;border:1px solid #d6ae52"><div style="color:#d6ae52;font-size:12px;font-weight:800;letter-spacing:1.5px;margin-bottom:8px">LIVE ORDER TRACKING</div><a href="{html.escape(live_track,quote=True)}" style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;font-weight:800;padding:13px 22px;border-radius:10px">VIEW LIVE ORDER STATUS</a><div style="font-size:11px;color:#d7dde6;margin-top:9px">Your original order email stays the same. Open this link anytime to see the latest status.</div><div style="margin-top:8px;font-size:10px;line-height:14px;word-break:break-all"><a href="{html.escape(live_track,quote=True)}" style="color:#d6ae52;text-decoration:underline">{html.escape(live_track)}</a></div></div>' if live_track else '<div style="margin:18px 0;padding:14px;background:#fff3cd;border:1px solid #e0bd55;border-radius:12px;text-align:center;font-size:12px;color:#5b4a16"><b>Live tracking link is not configured.</b><br>Add <b>APP_URL</b> in Streamlit Secrets, then place a new order to receive the link.</div>')
     customer=html.escape(str(order.get('customer_name') or '')); phone=html.escape(str(order.get('phone') or '')); address=html.escape(str(order.get('address') or '—')); delivery=html.escape(str(order.get('delivery_date') or '')); category=html.escape(str(order.get('category') or '')); product_name=html.escape(str(order.get('product_name') or '')); quantity=html.escape(str(order.get('quantity') or '')); unit_price=html.escape(money(order.get('unit_price'))); total=html.escape(money(order.get('total_price')))
     is_status_update=event_title.lower().startswith('order status')
     notice_title='Order status updated' if is_status_update else 'Order received'
     notice_text=f"Your order status is now <b>{html.escape(str(order.get('order_status') or 'Order Placed'))}</b>." if is_status_update else 'Your order has been successfully placed.'
-    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:800;">{html.escape(email_brand_name())}</div><div style="color:#d6ae52;font-size:12px;letter-spacing:3px;text-transform:uppercase;font-weight:700;margin-top:7px;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div><div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">{notice_title}</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">{notice_text}</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div>{track_block}</td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">{html.escape(email_brand_name())}</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
+    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:800;">{html.escape(email_brand_name())}</div><div style="color:#d6ae52;font-size:12px;letter-spacing:3px;text-transform:uppercase;font-weight:700;margin-top:7px;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div>{track_block}<div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">{notice_title}</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">{notice_text}</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div></td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">{html.escape(email_brand_name())}</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
     text_body=(f"RACHNA PLAYWOOD & HARDWEAR - {event_title}\n\nThank you, {order.get('customer_name') or ''}!\n\nCurrent status: {order.get('order_status') or 'Order Placed'}\n\nProduct: {order.get('product_name') or ''}\nCategory: {order.get('category') or ''}\nQuantity: {order.get('quantity') or ''}\nUnit price: {money(order.get('unit_price'))}\nTotal: {money(order.get('total_price'))}\n\nPhone: {order.get('phone') or ''}\nDelivery date: {order.get('delivery_date') or ''}\nAddress: {order.get('address') or ''}\n\nLive tracking: {live_track or 'Set APP_URL in Streamlit Secrets to enable it.'}\n")
     email_msg=EmailMessage(); email_msg['Subject']=f"Rachna Order #{order.get('order_number') or order.get('id') or ''} — {event_title}"; email_msg['From']=f'{from_name} <{user}>'; email_msg['To']=customer_email
     if admin_email and admin_email.lower()!=customer_email.lower(): email_msg['Cc']=admin_email
@@ -1090,12 +1143,26 @@ def login_page():
                         except Exception as e: st.error(f"Could not create account: {e}")
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def products(active=True):
     where="WHERE p.is_active=TRUE" if active else ""
     return query(f"""SELECT p.* FROM rachna_products p {where} ORDER BY p.created_at DESC""")
 
 @st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
+def images_for_products(product_ids):
+    ids=tuple(int(x) for x in product_ids if x is not None)
+    if not ids: return {}
+    rows=query("SELECT id,product_id,image_url,image_data,mime_type FROM rachna_product_images WHERE product_id=ANY(%s) ORDER BY product_id,image_order,id",(list(ids),))
+    out={pid:[] for pid in ids}
+    for row in rows:
+        raw=row.get('image_data')
+        if raw is None: b=b''
+        elif isinstance(raw,memoryview): b=raw.tobytes()
+        else: b=bytes(raw)
+        out.setdefault(int(row['product_id']),[]).append({'id':int(row['id']),'image_url':str(row.get('image_url') or ''),'image_data':b,'mime_type':row.get('mime_type') or 'image/jpeg'})
+    return out
+
 def images(pid):
     """Return only pickle-safe primitive values from PostgreSQL image rows."""
     rows = query(
@@ -1126,16 +1193,17 @@ def product_image_source(imrow):
     return imrow["image_url"] if imrow.get("image_url") else imrow["image_data"]
 
 
-def auto_product_card(product, ims, width, height):
+def auto_product_card(product, ims, width, height, mobile_height=None):
     if not ims: return
     imgs=[image_src_for_html(x) for x in ims]
     safe_imgs=json.dumps(imgs)
+    mobile_height=mobile_height or max(70,height-20)
     name=html.escape(str(product.get("title") or "")); cat=html.escape(str(product.get("category") or "")); price=html.escape(money(product.get("price")))
     dots="" if len(imgs)<=1 else "·"*len(imgs)
-    card=f"""<div class='product-mini' style='--product-h:{height}px;--product-h-mobile:{max(90,height-20)}px'><div id='pc_{product['id']}'><img src='{imgs[0]}'></div><div class='product-dots'>{dots}</div><div class='name'>{name}</div><div class='price'>{price}</div><div class='cat'>{cat}</div></div>"""
+    card=f"""<style>@media(max-width:720px){{#pc_{product['id']} img{{height:{mobile_height}px!important}}}}</style><div class='product-mini' style='--product-h:{height}px;--product-w:{width}%;--product-h-mobile:{mobile_height}px'><div id='pc_{product['id']}' style='width:var(--product-w);margin:0 auto'><img loading='lazy' src='{imgs[0]}' style='width:100%;height:var(--product-h);object-fit:contain;background:#fff;border-radius:10px;display:block'></div><div class='product-dots'>{dots}</div><div class='name'>{name}</div><div class='price'>{price}</div><div class='cat'>{cat}</div></div>"""
     script="""<script>(function(){const imgs=__IMGS__;let i=0;const root=document.getElementById('pc_ID');if(!root||imgs.length<2)return;setInterval(()=>{i=(i+1)%imgs.length;root.innerHTML='<img src=\"'+imgs[i]+'\" style=\"width:100%;height:100%;object-fit:contain;background:#fff;border-radius:10px;display:block\">'},1000)})();</script>""".replace('__IMGS__',safe_imgs).replace('ID',str(product['id']))
     import streamlit.components.v1 as components
-    components.html(card+script,height=height+78,scrolling=False)
+    components.html(card+script,height=max(height,mobile_height)+78,scrolling=False)
 
 
 def gallery(master=False):
@@ -1151,34 +1219,47 @@ def gallery(master=False):
                 elif len(uploads or [])>10: st.error("Upload a maximum of 10 photos.")
                 else:
                     try:
-                        row=query("INSERT INTO rachna_products(title,category,price,material,size,color,description) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id",(title.strip(),category,price or None,material,size,color,desc))[0]
+                        row=query("INSERT INTO rachna_products(title,category,brand,price,stock,featured,material,size,color,description) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",(title.strip(),category.strip(),brand.strip(),price or None,int(stock),featured,material,size,color,desc))[0]
                         for n,f in enumerate(uploads or []):
                             normalized,h=normalize_uploaded_image(f,max_size=1400,quality=80); url=github_upload(normalized,extension='jpg',folder='PRODUCT_IMG',image_hash=h)
                             query("INSERT INTO rachna_product_images(product_id,image_data,image_url,image_hash,mime_type,image_order) VALUES(%s,NULL,%s,%s,'image/jpeg',%s) ON CONFLICT DO NOTHING",(row['id'],url,h,n),fetch=False)
                         products.clear(); images.clear(); st.success("Product saved quickly."); st.rerun()
                     except Exception as e: st.error(f"Could not save product: {e}")
     items=products(active=not master)
-    left,right=st.columns([2,1]); term=left.text_input("Search products",key=f"search_{master}",placeholder="Name, color, category..."); categories=sorted({str(x.get('category') or 'Other') for x in items}); cat=right.selectbox("Category",["All"]+categories,key=f"cat_{master}")
-    items=[x for x in items if term.casefold() in ' '.join(str(x.get(k) or '') for k in ('title','category','material','size','color','description')).casefold() and (cat=='All' or x.get('category')==cat)]
+    if master:
+        left,right=st.columns([2,1]); term=left.text_input("Search products",key=f"search_{master}",placeholder="Name, color, category..."); categories=sorted({str(x.get('category') or 'Other') for x in items}); cat=right.selectbox("Category",["All"]+categories,key=f"cat_{master}")
+        items=[x for x in items if term.casefold() in ' '.join(str(x.get(k) or '') for k in ('title','category','material','size','color','description')).casefold() and (cat=='All' or x.get('category')==cat)]
+    else:
+        f1,f2,f3,f4,f5=st.columns([2,1,1,1,1]); term=f1.text_input('Search products',key='shop_search',placeholder='Name, brand, material...'); categories=sorted({str(x.get('category') or 'Other') for x in items}); cat=f2.selectbox('Category',['All']+categories,key='shop_category'); brands=sorted({str(x.get('brand') or '').strip() for x in items if str(x.get('brand') or '').strip()}); brand=f3.selectbox('Brand',['All']+brands,key='shop_brand'); prices=[float(x.get('price') or 0) for x in items]; max_price=max(prices or [0]); min_price=min(prices or [0]); price=f4.number_input('Max price',min_value=0.0,max_value=float(max_price or 0),value=float(max_price or 0),step=100.0,key='shop_max_price'); sort=f5.selectbox('Sort',['Newest','Price: Low to High','Price: High to Low','Name: A-Z'],key='shop_sort')
+        needle=term.casefold(); items=[x for x in items if needle in ' '.join(str(x.get(k) or '') for k in ('title','category','brand','material','size','color','description')).casefold() and (cat=='All' or x.get('category')==cat) and (brand=='All' or str(x.get('brand') or '')==brand) and float(x.get('price') or 0)<=price]
+        if sort=='Price: Low to High': items=sorted(items,key=lambda x: float(x.get('price') or 0))
+        elif sort=='Price: High to Low': items=sorted(items,key=lambda x: float(x.get('price') or 0),reverse=True)
+        elif sort=='Name: A-Z': items=sorted(items,key=lambda x: str(x.get('title') or '').casefold())
     if not items: st.info("No products found."); return
-    width,height=product_size_settings()
-    st.markdown(f"<div style='text-align:center;color:#d6ae52;font-size:.78rem;margin-bottom:.6rem'>Responsive grid · {width}% width · {height}px image height · auto slide every 1 second</div>",unsafe_allow_html=True)
+    width,height,mobile_height=product_size_settings()
+    st.markdown(f"<div style='text-align:center;color:#d6ae52;font-size:.78rem;margin-bottom:.6rem'>Image size · {width}% width · {height}px desktop · {mobile_height}px mobile · auto slide</div>",unsafe_allow_html=True)
     # Dense responsive product grid; each product remains independently auto-sliding.
+    image_map=images_for_products([p['id'] for p in items])
     for start_idx in range(0,len(items),4):
         cols=st.columns(4,gap='small')
         for col,p in zip(cols,items[start_idx:start_idx+4]):
             with col:
-                ims=images(p['id'])
-                auto_product_card(p,ims,width,height)
+                ims=image_map.get(int(p['id']),[])
+                auto_product_card(p,ims,width,height,mobile_height)
                 if not master and st.session_state.get('user_id'):
-                    if st.button('＋ Add to Bag',key=f'bag_add_{p["id"]}',use_container_width=True):
-                        add_to_bag(p,1); st.success(f'{p["title"]} added to Your Bag.')
+                    cbag,cwish=st.columns(2)
+                    with cbag:
+                        if st.button('＋ Add to Bag',key=f'bag_add_{p["id"]}',use_container_width=True): add_to_bag(p,1); st.success(f'{p["title"]} added to Your Bag.')
+                    with cwish:
+                        saved=int(p['id']) in st.session_state.wishlist
+                        if st.button('♥ Saved' if saved else '♡ Save',key=f'wish_add_{p["id"]}',use_container_width=True):
+                            (st.session_state.wishlist.discard(int(p['id'])) if saved else st.session_state.wishlist.add(int(p['id']))); st.rerun()
                 if master:
                     with st.expander(f"Edit · {p['title']}"):
                         with st.form(f"edit_{p['id']}"):
-                            t=st.text_input("Name",p['title']); c=st.text_input("Category",p['category']); pr=st.number_input("Price",min_value=0.0,value=float(p['price'] or 0),step=100.0); ma=st.text_input("Material",p['material'] or ''); sz=st.text_input("Size",p['size'] or ''); co=st.text_input("Color",p['color'] or ''); de=st.text_area("Details",p['description'] or ''); active=st.checkbox("Show in public gallery",bool(p['is_active'])); more=st.file_uploader("Add photos",type=['jpg','jpeg','png','webp'],accept_multiple_files=True,key=f"more_{p['id']}"); upd=st.form_submit_button("Update")
+                            t=st.text_input("Name",p['title']); c=st.text_input("Category",p['category']); br=st.text_input("Brand",p.get('brand') or ''); pr=st.number_input("Price",min_value=0.0,value=float(p['price'] or 0),step=100.0); stock2=st.number_input("Stock",min_value=0,max_value=100000,value=int(p.get('stock') or 0),step=1); feat2=st.checkbox("Featured",bool(p.get('featured'))); ma=st.text_input("Material",p['material'] or ''); sz=st.text_input("Size",p['size'] or ''); co=st.text_input("Color",p['color'] or ''); de=st.text_area("Details",p['description'] or ''); active=st.checkbox("Show in public gallery",bool(p['is_active'])); more=st.file_uploader("Add photos",type=['jpg','jpeg','png','webp'],accept_multiple_files=True,key=f"more_{p['id']}"); upd=st.form_submit_button("Update")
                         if upd:
-                            query("UPDATE rachna_products SET title=%s,category=%s,price=%s,material=%s,size=%s,color=%s,description=%s,is_active=%s,updated_at=NOW() WHERE id=%s",(t,c,pr or None,ma,sz,co,de,active,p['id']),fetch=False)
+                            query("UPDATE rachna_products SET title=%s,category=%s,brand=%s,price=%s,stock=%s,featured=%s,material=%s,size=%s,color=%s,description=%s,is_active=%s,updated_at=NOW() WHERE id=%s",(t,c,br,pr or None,int(stock2),feat2,ma,sz,co,de,active,p['id']),fetch=False)
                             for n,f in enumerate(more or [],start=len(ims)):
                                 norm,h=normalize_uploaded_image(f,max_size=1400,quality=80); url=github_upload(norm,extension='jpg',folder='PRODUCT_IMG',image_hash=h); query("INSERT INTO rachna_product_images(product_id,image_data,image_url,image_hash,mime_type,image_order) VALUES(%s,NULL,%s,%s,'image/jpeg',%s) ON CONFLICT DO NOTHING",(p['id'],url,h,n),fetch=False)
                             products.clear(); images.clear(); st.rerun()
@@ -1340,7 +1421,7 @@ def admin_orders_page():
                         if fresh:
                             email_sync_ok,email_sync_msg=send_order_email(dict(fresh[0]), event_title='Order Placed', send=False)
                         if email_sync_ok:
-                            st.success(f"Status updated to {ns}. The original order email is updated in the app mailbox; no new email was sent.")
+                            st.success(f"Status updated to {ns}. The ONE original email record is refreshed in the app mailbox; no new email was sent. The Gmail email uses the live tracking link above to show the latest status.")
                         else:
                             st.warning(f"Status updated to {ns}, but the original email preview could not be refreshed: {email_sync_msg}")
                     else:
@@ -1486,35 +1567,270 @@ def init_db_cached():
 
 
 NAV_LABELS = {
-    'Home':'Home',
-    'Gallery':'Products',
-    'Your Bag':'My Bag',
-    'Order':'Checkout',
-    'Track Order':'Track Order',
-    'Order History':'My Orders',
-    'Account':'My Account',
-    'About':'About Us',
-    'Contact Us':'Contact Us',
-    'Order Details':'Order Management',
-    'Emails':'Email Center',
-    'Master Gallery':'Product Management',
-    'Master Account':'Staff Management',
-    'Admin Master':'System Settings',
-    'Login':'Login',
+    'Home':'Home','Categories':'Categories','Featured':'Featured Products','Offers':'Offers / Deals','New Arrivals':'New Arrivals',
+    'Gallery':'All Products / Shop','Category Page':'Category Page','Product Details':'Product Details','Search Results':'Search Results',
+    'Your Bag':'Cart','Order':'Checkout','Track Order':'Order Details / Tracking','Order History':'My Orders','Wishlist':'Wishlist',
+    'Account':'My Account','Notifications':'Notifications','Help Center':'Help & Support','About':'About Us','Contact Us':'Contact Us',
+    'Order Details':'Manage Orders','Emails':'Email Center','Master Gallery':'Manage Products','Master Account':'Staff Management','Admin Master':'App Settings',
+    'Admin Dashboard':'Admin Dashboard','Manage Categories':'Manage Categories','Customers':'Customers','Offers Admin':'Offers / Coupons','Inventory':'Inventory / Stock','Sales Reports':'Payments / Sales Report','Reviews':'Reviews & Ratings','Login':'Login',
 }
 
 def nav_label(page):
     return NAV_LABELS.get(page, page)
 
+def wishlist_page():
+    page_header('SAVED PRODUCTS','Wishlist','Keep products you may want to order later.')
+    if not st.session_state.get('user_id'): st.info('Please sign in to use Wishlist.'); return
+    ids=sorted({int(x) for x in st.session_state.get('wishlist',set())})
+    if not ids: st.info('Your Wishlist is empty. Open Products and save items you like.'); return
+    rows=query('SELECT * FROM rachna_products WHERE id=ANY(%s) AND is_active=TRUE ORDER BY created_at DESC',(ids,)); image_map=images_for_products([r['id'] for r in rows]); _,h,hm=product_size_settings()
+    for start_idx in range(0,len(rows),4):
+        cols=st.columns(4,gap='small')
+        for col,p in zip(cols,rows[start_idx:start_idx+4]):
+            with col:
+                auto_product_card(p,image_map.get(int(p['id']),[]),100,h,hm)
+                if st.button('＋ Add to Bag',key=f'wish_bag_{p["id"]}',use_container_width=True): add_to_bag(p,1); st.success('Added to My Bag.')
+                if st.button('Remove',key=f'wish_remove_{p["id"]}',use_container_width=True): st.session_state.wishlist.discard(int(p['id'])); st.rerun()
+
+def notifications_page():
+    page_header('UPDATES','Notifications','Your latest order status changes and tracking notes.')
+    if not st.session_state.get('user_id'): st.info('Please sign in to view notifications.'); return
+    rows=query('SELECT o.order_number,h.status,h.note,h.changed_at FROM rachna_order_status_history h JOIN rachna_orders o ON o.id=h.order_id WHERE o.user_id=%s ORDER BY h.changed_at DESC LIMIT 50',(st.session_state.user_id,))
+    if not rows: st.info('No order updates yet.'); return
+    for r in rows:
+        st.markdown(f"<div class='profile-card' style='text-align:left;margin-bottom:8px'><b>#{html.escape(str(r.get("order_number") or ""))}</b><br><span style='color:#d6ae52;font-weight:800'>{html.escape(str(r.get("status") or ""))}</span><br>{html.escape(str(r.get("note") or "Status updated"))}<br><small style='color:#94a3b8'>{html.escape(str(r.get("changed_at") or ""))}</small></div>",unsafe_allow_html=True)
+
+def help_page():
+    page_header('HELP & SUPPORT','Help Center','Quick answers for orders, accounts and products.')
+    faqs=[('How do I order?','Open Products, add items to My Bag, then open Checkout and place one combined order.'),('How do I track an order?','Open Track Order, or use the live tracking link from your order email.'),('Can I order multiple products together?','Yes. Add multiple products to My Bag and checkout once.'),('How can I change my account details?','Open My Account after signing in.'),('Why does my old email still show the old status?','Delivered Gmail messages cannot be edited. Use the live tracking link in the original order email.') ]
+    for q,a in faqs:
+        with st.expander(q): st.write(a)
+    st.markdown('<div class="hero"><h3>Need more help?</h3><p>Open Contact Us for support.</p></div>',unsafe_allow_html=True)
+
+def _go(page, **state):
+    for k,v in state.items(): st.session_state[k]=v
+    st.session_state.page=page; st.session_state._consumed_page_qp=page; st.rerun()
+
+
+def _render_product_list(rows, key_prefix='shop'):
+    if not rows: st.info('No products found.'); return
+    image_map=images_for_products([r['id'] for r in rows]); _,h,hm=product_size_settings()
+    for start_idx in range(0,len(rows),4):
+        cols=st.columns(4,gap='small')
+        for col,p in zip(cols,rows[start_idx:start_idx+4]):
+            with col:
+                auto_product_card(p,image_map.get(int(p['id']),[]),100,h,hm)
+                stock=int(p.get('stock') or 0)
+                st.caption(('In stock' if stock>0 else 'Stock not set') + (f' · {stock}' if stock>0 else ' · Admin can set stock'))
+                if st.button('View Details',key=f'{key_prefix}_detail_{p["id"]}',use_container_width=True): _go('Product Details',selected_product_id=int(p['id']))
+                c1,c2=st.columns(2)
+                with c1:
+                    if st.button('＋ Cart',key=f'{key_prefix}_cart_{p["id"]}',use_container_width=True,disabled=False): add_to_bag(p,1); st.success('Added.')
+                with c2:
+                    saved=int(p['id']) in st.session_state.get('wishlist',set())
+                    if st.button('♥' if saved else '♡',key=f'{key_prefix}_wish_{p["id"]}',use_container_width=True):
+                        if saved: st.session_state.wishlist.discard(int(p['id']))
+                        else: st.session_state.wishlist.add(int(p['id']))
+                        if st.session_state.get('user_id'):
+                            uid=st.session_state.user_id; pid=int(p['id'])
+                            if saved: query('DELETE FROM rachna_wishlist WHERE user_id=%s AND product_id=%s',(uid,pid),fetch=False)
+                            else: query('INSERT INTO rachna_wishlist(user_id,product_id) VALUES(%s,%s) ON CONFLICT DO NOTHING',(uid,pid),fetch=False)
+                        st.rerun()
+
+
+def categories_page():
+    page_header('SHOP BY CATEGORY','Categories','Browse plywood, hardware, laminate, adhesive and more.')
+    rows=query('SELECT name,COUNT(p.id) AS product_count FROM rachna_categories c LEFT JOIN rachna_products p ON p.category=c.name AND p.is_active=TRUE WHERE c.active=TRUE GROUP BY c.name ORDER BY c.name')
+    if not rows: rows=[{'name':x,'product_count':sum(1 for p in products() if p.get('category')==x)} for x in sorted({str(p.get('category') or 'Other') for p in products()})]
+    for start in range(0,len(rows),3):
+        cols=st.columns(3)
+        for col,r in zip(cols,rows[start:start+3]):
+            with col:
+                st.markdown(f"<div class='hero' style='margin-bottom:10px'><h3>🪵 {html.escape(str(r['name']))}</h3><p>{int(r.get('product_count') or 0)} products</p></div>",unsafe_allow_html=True)
+                if st.button(f"Shop {r['name']}",key=f"cat_go_{r['name']}",use_container_width=True): _go('Category Page',selected_category=str(r['name']))
+
+
+def category_page():
+    cat=st.session_state.get('selected_category','')
+    page_header('CATEGORY','Category Page',cat or 'Choose a category')
+    if not cat: categories_page(); return
+    rows=query('SELECT * FROM rachna_products WHERE is_active=TRUE AND lower(category)=lower(%s) ORDER BY created_at DESC',(cat,))
+    _render_product_list(rows,'category')
+
+
+def featured_page():
+    page_header('FEATURED','Featured Products','Hand-picked products from Rachna.')
+    rows=query('SELECT * FROM rachna_products WHERE is_active=TRUE AND featured=TRUE ORDER BY created_at DESC LIMIT 40')
+    if not rows: rows=products()[:8]
+    _render_product_list(rows,'featured')
+
+
+def new_arrivals_page():
+    page_header('LATEST','New Arrivals','Recently added products.')
+    _render_product_list(products()[:40],'new')
+
+
+def offers_page():
+    page_header('DEALS','Offers / Deals','Current offers and promotional deals.')
+    today=date.today(); rows=query("SELECT * FROM rachna_offers WHERE active=TRUE AND (start_date IS NULL OR start_date<=%s) AND (end_date IS NULL OR end_date>=%s) ORDER BY created_at DESC",(today,today))
+    if not rows: st.info('No active offers right now. Check back soon.')
+    for r in rows: st.markdown(f"<div class='hero' style='text-align:left;margin-bottom:12px'><h3>{html.escape(r['title'])}</h3><p>Code: <b>{html.escape(r.get('code') or '—')}</b> · {html.escape(str(r['discount_value']))}{'%' if r['discount_type']=='Percent' else ' ₹'} off</p></div>",unsafe_allow_html=True)
+    if st.button('Shop all products',type='primary'): _go('Gallery')
+
+
+def search_results_page():
+    page_header('SEARCH','Search Results','Find products by name, category, brand, size or material.')
+    term=st.text_input('Search',value=st.session_state.get('search_term',''),placeholder='Search products...')
+    if st.button('Search',type='primary'): st.session_state.search_term=term.strip(); st.rerun()
+    q=(st.session_state.get('search_term') or '').strip()
+    if not q: st.info('Enter a product name, category or brand.'); return
+    rows=query("SELECT * FROM rachna_products WHERE is_active=TRUE AND (title ILIKE %s OR category ILIKE %s OR brand ILIKE %s OR material ILIKE %s OR size ILIKE %s OR description ILIKE %s) ORDER BY created_at DESC LIMIT 80",tuple([f'%{q}%']*6))
+    st.caption(f'{len(rows)} results for “{q}”'); _render_product_list(rows,'search')
+
+
+def product_details_page():
+    pid=st.session_state.get('selected_product_id')
+    if not pid: st.info('Select a product from Products.'); return
+    rows=query('SELECT * FROM rachna_products WHERE id=%s AND is_active=TRUE',(pid,))
+    if not rows: st.error('Product not found.'); return
+    p=rows[0]; ims=images(pid); page_header('PRODUCT','Product Details',str(p.get('title') or ''))
+    left,right=st.columns([1.15,1])
+    with left:
+        if ims: st.image([product_image_source(x) for x in ims],use_container_width=True)
+        else: st.info('No product image available.')
+    with right:
+        st.markdown(f"<div class='profile-card' style='text-align:left'><h2>{html.escape(str(p['title']))}</h2><div style='color:#d6ae52;font-size:1.5rem;font-weight:900'>{money(p.get('price'))}</div><p><b>Category:</b> {html.escape(str(p.get('category') or '—'))}<br><b>Brand:</b> {html.escape(str(p.get('brand') or 'Rachna'))}<br><b>Size:</b> {html.escape(str(p.get('size') or '—'))}<br><b>Stock:</b> {int(p.get('stock') or 0)}</p><p>{html.escape(str(p.get('description') or 'No description available.'))}</p></div>",unsafe_allow_html=True)
+        qty=st.number_input('Quantity',min_value=1.0,value=1.0,step=1.0,key=f'detail_qty_{pid}')
+        c1,c2=st.columns(2)
+        with c1:
+            if st.button('＋ Add to Cart',type='primary',use_container_width=True,disabled=False): add_to_bag(p,qty); st.success('Added to cart.')
+        with c2:
+            if st.button('Buy / Checkout',use_container_width=True,disabled=False): add_to_bag(p,qty); _go('Order')
+        st.subheader('Specifications'); st.write({'Material':p.get('material') or '—','Height × Width / Size':p.get('size') or '—','Color':p.get('color') or '—','Brand':p.get('brand') or 'Rachna'})
+    reviews=query('SELECT r.rating,r.review,r.created_at,u.name FROM rachna_reviews r LEFT JOIN rachna_users u ON u.id=r.user_id WHERE r.product_id=%s AND r.active=TRUE ORDER BY r.created_at DESC LIMIT 30',(pid,))
+    st.subheader('Reviews & Ratings')
+    if st.session_state.get('user_id'):
+        with st.form(f'review_form_{pid}'):
+            rating=st.slider('Rating',1,5,5); text=st.text_area('Review'); send=st.form_submit_button('Submit review')
+        if send: query('INSERT INTO rachna_reviews(user_id,product_id,rating,review) VALUES(%s,%s,%s,%s)',(st.session_state.user_id,pid,rating,text.strip()),fetch=False); st.success('Review submitted.'); st.rerun()
+    for r in reviews: st.markdown(f"**{html.escape(str(r.get('name') or 'Customer'))}** · {'⭐'*int(r['rating'])}<br>{html.escape(str(r.get('review') or ''))}",unsafe_allow_html=True)
+
+
+def cart_page(): your_bag_page()
+
+
+def customer_account_page():
+    user=current_user(); page_header('ACCOUNT','My Account','Profile · Addresses · Orders · Wishlist · Settings')
+    if not user: st.info('Please sign in first.'); return
+    tabs=st.tabs(['Profile','Addresses','Orders','Wishlist','Settings'])
+    with tabs[0]:
+        with st.form('customer_profile'):
+            name=st.text_input('Name',user['name']); phone=st.text_input('Phone',user['phone']); email=st.text_input('Email',user['email']); age=st.number_input('Age',1,120,int(user.get('age') or 18)); dp=st.file_uploader('Profile photo',type=['jpg','jpeg','png','webp']); save=st.form_submit_button('Save profile',type='primary')
+        if save:
+            query('UPDATE rachna_users SET name=%s,phone=%s,email=%s,age=%s,updated_at=NOW() WHERE id=%s',(name.strip(),phone.strip(),email.strip().lower(),age,user['id']),fetch=False)
+            if dp: save_user_dp(dp,user['id'])
+            current_user_by_id.clear(); st.success('Profile updated.'); st.rerun()
+    with tabs[1]:
+        addresses=query('SELECT * FROM rachna_addresses WHERE user_id=%s ORDER BY is_default DESC,created_at DESC',(user['id'],))
+        with st.form('address_add'):
+            label=st.text_input('Label','Home'); addr=st.text_area('Address',user.get('address') or ''); pin=st.text_input('Pincode',user.get('pincode') or '',max_chars=6); ph=st.text_input('Phone',user['phone']); default=st.checkbox('Make default'); add=st.form_submit_button('Add address')
+        if add and addr.strip():
+            if default: query('UPDATE rachna_addresses SET is_default=FALSE WHERE user_id=%s',(user['id'],),fetch=False)
+            query('INSERT INTO rachna_addresses(user_id,label,address,pincode,phone,is_default) VALUES(%s,%s,%s,%s,%s,%s)',(user['id'],label.strip(),addr.strip(),pin.strip(),ph.strip(),default),fetch=False); st.rerun()
+        for a in addresses: st.markdown(f"<div class='profile-card' style='text-align:left;margin:8px 0'><b>{html.escape(a['label'])}</b>{' · Default' if a['is_default'] else ''}<br>{html.escape(a['address'])}<br>{html.escape(a.get('pincode') or '')} · {html.escape(a.get('phone') or '')}</div>",unsafe_allow_html=True)
+    with tabs[2]: user_order_history()
+    with tabs[3]: wishlist_page()
+    with tabs[4]:
+        st.write('Notification and account preferences'); st.checkbox('Order email updates',value=True,key='pref_email_updates'); st.checkbox('Product/offers notifications',value=True,key='pref_product_updates')
+        if st.button('Save settings'): st.success('Settings saved for this session.')
+
+
+def admin_dashboard_page():
+    if not st.session_state.get('admin'): st.error('Admin login required.'); return
+    page_header('ADMIN','Admin Dashboard','Sales · orders · revenue · products · customers')
+    total_orders=int(query('SELECT COUNT(*) n FROM rachna_orders')[0]['n'] or 0); revenue=float(query("SELECT COALESCE(SUM(total_price),0) n FROM rachna_orders WHERE payment_status IN ('Paid','Success')")[0]['n'] or 0); customer_count=int(query('SELECT COUNT(*) n FROM rachna_users WHERE COALESCE(is_admin,FALSE)=FALSE')[0]['n'] or 0); product_count=len(products())
+    a,b,c,d=st.columns(4); a.metric('Orders',total_orders); b.metric('Revenue',money(revenue)); c.metric('Customers',customer_count); d.metric('Products',product_count)
+    recent=query('SELECT order_number,customer_name,total_price,order_status,created_at FROM rachna_orders ORDER BY created_at DESC LIMIT 10')
+    if recent: st.dataframe(recent,use_container_width=True,hide_index=True)
+
+
+def admin_categories_page():
+    if not st.session_state.get('admin'): st.error('Admin login required.'); return
+    page_header('CATALOG','Manage Categories','Create and maintain product categories.')
+    with st.form('add_category'):
+        name=st.text_input('Category name'); add=st.form_submit_button('Add category',type='primary')
+    if add and name.strip():
+        try: query('INSERT INTO rachna_categories(name) VALUES(%s)',(name.strip(),),fetch=False); st.success('Category added.'); st.rerun()
+        except Exception as e: st.error(str(e))
+    rows=query('SELECT c.name,c.active,COUNT(p.id) AS product_count FROM rachna_categories c LEFT JOIN rachna_products p ON p.category=c.name GROUP BY c.id ORDER BY c.name')
+    for r in rows:
+        c1,c2,c3=st.columns([3,1,1]); c1.write(f"{r['name']} · {int(r['product_count'] or 0)} products"); active=c2.checkbox('Active',bool(r['active']),key=f'cat_active_{r["name"]}')
+        if c3.button('Save',key=f'cat_save_{r["name"]}'): query('UPDATE rachna_categories SET active=%s WHERE name=%s',(active,r['name']),fetch=False); st.rerun()
+
+
+def admin_customers_page():
+    if not st.session_state.get('admin'): st.error('Admin login required.'); return
+    page_header('CUSTOMERS','Customers','Customer accounts and order activity.')
+    rows=query("SELECT u.id,u.name,u.email,u.phone,u.active,COUNT(o.id) AS orders,COALESCE(SUM(o.total_price),0) AS spent FROM rachna_users u LEFT JOIN rachna_orders o ON o.user_id=u.id WHERE COALESCE(u.is_admin,FALSE)=FALSE GROUP BY u.id ORDER BY u.created_at DESC LIMIT 500")
+    st.dataframe(rows,use_container_width=True,hide_index=True)
+
+
+def admin_offers_page():
+    if not st.session_state.get('admin'): st.error('Admin login required.'); return
+    page_header('PROMOTIONS','Offers / Coupons','Create and control customer deals.')
+    with st.form('offer_form'):
+        title=st.text_input('Offer title'); code=st.text_input('Coupon code'); dtype=st.selectbox('Discount type',['Percent','Flat']); val=st.number_input('Discount value',0.0,step=1.0); active=st.checkbox('Active',True); add=st.form_submit_button('Save offer',type='primary')
+    if add and title.strip():
+        try: query('INSERT INTO rachna_offers(title,code,discount_type,discount_value,active) VALUES(%s,%s,%s,%s,%s)',(title.strip(),code.strip().upper() or None,dtype,val,active),fetch=False); st.success('Offer saved.'); st.rerun()
+        except Exception as e: st.error(str(e))
+    for r in query('SELECT * FROM rachna_offers ORDER BY created_at DESC'):
+        c1,c2,c3=st.columns([4,1,1]); c1.write(f"{r['title']} · {r['code'] or '—'} · {r['discount_value']}{'%' if r['discount_type']=='Percent' else ' ₹'}"); c2.write('Active' if r['active'] else 'Off')
+        if c3.button('Delete',key=f'offer_del_{r["id"]}'): query('DELETE FROM rachna_offers WHERE id=%s',(r['id'],),fetch=False); st.rerun()
+
+
+def admin_inventory_page():
+    if not st.session_state.get('admin'): st.error('Admin login required.'); return
+    page_header('INVENTORY','Inventory / Stock','Update product stock, price, brand and featured status.')
+    rows=products(active=False)
+    for p in rows:
+        with st.expander(f"{p['title']} · Stock {int(p.get('stock') or 0)}"):
+            with st.form(f'inv_{p["id"]}'):
+                c1,c2,c3,c4=st.columns(4); stock=c1.number_input('Stock',0,100000,int(p.get('stock') or 0),key=f'stock_{p["id"]}'); price=c2.number_input('Price',0.0,10000000.0,float(p.get('price') or 0),step=100.0,key=f'price_{p["id"]}'); brand=c3.text_input('Brand',p.get('brand') or '',key=f'brand_{p["id"]}'); featured=c4.checkbox('Featured',bool(p.get('featured')),key=f'feat_{p["id"]}'); save=st.form_submit_button('Save')
+            if save: query('UPDATE rachna_products SET stock=%s,price=%s,brand=%s,featured=%s,updated_at=NOW() WHERE id=%s',(stock,price,brand.strip(),featured,p['id']),fetch=False); products.clear(); st.success('Inventory updated.'); st.rerun()
+
+
+def admin_reports_page():
+    if not st.session_state.get('admin'): st.error('Admin login required.'); return
+    page_header('REPORTS','Payments / Sales Report','Sales, payment and order performance.')
+    rows=query("SELECT payment_method,payment_status,COUNT(*) orders,COALESCE(SUM(total_price),0) revenue FROM rachna_orders GROUP BY payment_method,payment_status ORDER BY orders DESC")
+    if rows: st.dataframe(rows,use_container_width=True,hide_index=True)
+    daily=query("SELECT DATE(created_at) day,COUNT(*) orders,COALESCE(SUM(total_price),0) sales FROM rachna_orders GROUP BY DATE(created_at) ORDER BY day DESC LIMIT 30")
+    if daily: st.dataframe(daily,use_container_width=True,hide_index=True)
+
+
+def admin_reviews_page():
+    if not st.session_state.get('admin'): st.error('Admin login required.'); return
+    page_header('REVIEWS','Reviews & Ratings','Moderate customer reviews.')
+    rows=query('SELECT r.id,p.title,r.rating,r.review,u.name,r.active,r.created_at FROM rachna_reviews r JOIN rachna_products p ON p.id=r.product_id LEFT JOIN rachna_users u ON u.id=r.user_id ORDER BY r.created_at DESC LIMIT 500')
+    for r in rows:
+        c1,c2,c3=st.columns([5,1,1]); c1.markdown(f"**{html.escape(str(r['title']))}** · {'⭐'*int(r['rating'])} · {html.escape(str(r.get('name') or 'Customer'))}<br>{html.escape(str(r.get('review') or ''))}",unsafe_allow_html=True); c2.write('Live' if r['active'] else 'Hidden')
+        if c3.button('Hide' if r['active'] else 'Show',key=f'review_{r["id"]}'): query('UPDATE rachna_reviews SET active=%s WHERE id=%s',(not bool(r['active']),r['id']),fetch=False); st.rerun()
+
+
+def admin_settings_page(): site_admin_page()
+
 def main():
-    try:
-        init_db_cached()
-    except Exception as e:
-        st.error('PostgreSQL connection or table setup failed.'); st.code(str(e)); st.stop()
     if 'admin' not in st.session_state: st.session_state.admin=False
     if 'user_id' not in st.session_state: st.session_state.user_id=None
     if 'page' not in st.session_state: st.session_state.page='Login'
     track_q=str(st.query_params.get('track') or '').strip()
+    needs_full_schema=bool(st.session_state.user_id or st.session_state.admin or track_q or st.session_state.page not in ('Login',))
+    try:
+        if needs_full_schema: init_db_cached()
+        else: login_bootstrap_cached()
+    except Exception as e:
+        st.error('PostgreSQL connection or table setup failed.'); st.code(str(e)); st.stop()
+    if 'wishlist' not in st.session_state: st.session_state.wishlist=set()
     if track_q:
         st.session_state.page='Track Order'
     # Sidebar visibility is controlled by Streamlit's native, accessible hamburger toggle.
@@ -1523,7 +1839,7 @@ def main():
         icon=(f"<img src='{html.escape(dp,quote=True)}' style='width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #d6ae52'>" if dp else "<div style='width:44px;height:44px;border-radius:50%;background:#071b33;border:2px solid #d6ae52;display:flex;align-items:center;justify-content:center;font-size:22px'>👤</div>")
         st.markdown(f"<a href='?page=Account' title='Open profile' style='position:fixed;top:.55rem;right:.75rem;z-index:999999;text-decoration:none'>{icon}</a>",unsafe_allow_html=True)
     qp=st.query_params.get('page')
-    valid_pages={'Home','Gallery','Order','Order History','Account','Order Details','Track Order','Your Bag','About','Contact Us','Master Gallery','Master Account','Admin Master','Emails','Login'}
+    valid_pages={'Home','Categories','Featured','Offers','New Arrivals','Gallery','Category Page','Product Details','Search Results','Your Bag','Order','Track Order','Order History','Wishlist','Account','Notifications','Help Center','About','Contact Us','Order Details','Emails','Master Gallery','Master Account','Admin Master','Admin Dashboard','Manage Categories','Customers','Offers Admin','Inventory','Sales Reports','Reviews','Login'}
     # Consume a page deep-link only once. Previously ?page=Account stayed in
     # the browser URL, so every sidebar click was immediately forced back to
     # Account on the next Streamlit rerun.
@@ -1532,15 +1848,15 @@ def main():
         st.session_state._consumed_page_qp=qp
     # Keep the sidebar usable while replacing its visible Streamlit header control with the custom button.
     with st.sidebar:
-        logo=get_setting('app_logo')
+        logo=get_setting('app_logo') if needs_full_schema else None
         if logo and image_row_source(logo): st.image(image_row_source(logo),use_container_width=True)
-        st.markdown('<div style="text-align:center;color:#d6ae52;font-weight:800">RACHNA PLAYWOOD & HARDWARE</div>',unsafe_allow_html=True)
+        else: st.markdown('<div style="text-align:center;color:#d6ae52;font-weight:800">RACHNA PLAYWOOD & HARDWARE</div>',unsafe_allow_html=True)
         st.divider()
 
         # Two-level sidebar navigation:
         # 1) User navigation is always first for admins as well.
         # 2) Admin-only navigation appears below it and is never shown to normal users.
-        user_nav=['Home','Gallery','Your Bag','Order','Track Order','Order History','Account','About','Contact Us']
+        user_nav=['Home','Gallery','Your Bag','Wishlist','Order','Track Order','Notifications','Order History','Account','About','Contact Us','Help Center']
         admin_nav=['Order Details','Emails','Master Gallery','Master Account','Admin Master']
 
         if st.session_state.admin:
@@ -1588,27 +1904,58 @@ def main():
         try:
             if not page_is_visible(p): st.session_state.page='Home'; p='Home'
         except Exception: pass
-    apply_page_branding(p)
+    if needs_full_schema: apply_page_branding(p)
     if p=='Login': login_page()
     elif p=='Home':
         st.markdown(f'<div class="hero"><div class="brand-sub">CRAFTED FOR YOUR SPACE</div><h2>{APP_NAME}</h2><p>Furniture, plywood and hardware — explore our collection.</p></div>',unsafe_allow_html=True)
         items=products(); a,b,c=st.columns(3); a.metric('Products',len(items)); b.metric('Furniture',sum(x['category']=='Furniture' for x in items)); c.metric('Hardware / plywood',sum(x['category'] in ['Hardware','Plywood'] for x in items))
         if items:
-            st.subheader('Featured collection'); width,height=product_size_settings();
+            st.subheader('Featured collection'); width,height,mobile_height=product_size_settings(); image_map=images_for_products([x['id'] for x in items[:8]])
             for start_idx in range(0,min(8,len(items)),4):
                 cols=st.columns(4)
                 for col,x in zip(cols,items[start_idx:start_idx+4]):
-                    with col: auto_product_card(x,images(x['id']),width,height)
+                    with col: auto_product_card(x,image_map.get(int(x['id']),[]),width,height,mobile_height)
         else: st.info('Admin can add products using Master Gallery.')
+        st.subheader('Shop by Category')
+        cats=query('SELECT name FROM rachna_categories WHERE active=TRUE ORDER BY name LIMIT 8')
+        if cats:
+            cols=st.columns(min(4,len(cats)))
+            for col,r in zip(cols,cats[:4]):
+                with col:
+                    if st.button(str(r['name']),key=f'home_cat_{r["name"]}',use_container_width=True): _go('Category Page',selected_category=str(r['name']))
+        st.subheader('New Arrivals')
+        _render_product_list(products()[:4],'home_new')
+        st.subheader('Offers / Deals')
+        active_offers=query("SELECT title,code,discount_value,discount_type FROM rachna_offers WHERE active=TRUE ORDER BY created_at DESC LIMIT 3")
+        if active_offers:
+            st.write(' · '.join(f"{r['title']} ({r['code'] or 'Deal'})" for r in active_offers))
+        if st.button('View all offers',key='home_offers'): _go('Offers')
+    elif p=='Categories': categories_page()
+    elif p=='Featured': featured_page()
+    elif p=='Offers': offers_page()
+    elif p=='New Arrivals': new_arrivals_page()
     elif p=='Gallery': gallery(False)
+    elif p=='Category Page': category_page()
+    elif p=='Product Details': product_details_page()
+    elif p=='Search Results': search_results_page()
+    elif p=='Wishlist': wishlist_page()
+    elif p=='Notifications': notifications_page()
+    elif p=='Help Center': help_page()
     elif p=='Master Gallery': gallery(True)
     elif p=='Order': order_page()
     elif p=='Your Bag': your_bag_page()
     elif p=='Order History': user_order_history()
     elif p=='Track Order': user_track_order_page() if st.session_state.user_id else public_track_page()
     elif p=='Order Details': admin_orders_page()
+    elif p=='Admin Dashboard': admin_dashboard_page()
+    elif p=='Manage Categories': admin_categories_page()
+    elif p=='Customers': admin_customers_page()
+    elif p=='Offers Admin': admin_offers_page()
+    elif p=='Inventory': admin_inventory_page()
+    elif p=='Sales Reports': admin_reports_page()
+    elif p=='Reviews': admin_reviews_page()
     elif p=='Emails': emails_page()
-    elif p=='Account': account(False)
+    elif p=='Account': customer_account_page()
     elif p=='Master Account': account(True)
     elif p=='Admin Master': site_admin_page()
     elif p=='About':
