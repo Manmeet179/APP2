@@ -1856,8 +1856,19 @@ def main():
         # Two-level sidebar navigation:
         # 1) User navigation is always first for admins as well.
         # 2) Admin-only navigation appears below it and is never shown to normal users.
-        user_nav=['Home','Gallery','Your Bag','Wishlist','Order','Track Order','Notifications','Order History','Account','About','Contact Us','Help Center']
-        admin_nav=['Order Details','Emails','Master Gallery','Master Account','Admin Master']
+        # Admin sees the COMPLETE customer navigation first, then every admin module.
+        # Normal users see only the customer navigation.
+        user_nav=[
+            'Home','Categories','Featured','Offers','New Arrivals',
+            'Gallery','Category Page','Product Details','Search Results',
+            'Your Bag','Order','Track Order','Order History','Wishlist',
+            'Account','Notifications','Help Center','About','Contact Us'
+        ]
+        admin_nav=[
+            'Admin Dashboard','Order Details','Master Gallery','Manage Categories',
+            'Customers','Offers Admin','Inventory','Sales Reports','Reviews',
+            'Emails','Master Account','Admin Master'
+        ]
 
         if st.session_state.admin:
             st.markdown('### 👤 User Navigation')
