@@ -1,15 +1,12 @@
 from email.message import EmailMessage
 
-"""
-RACHNA PLAYWOO & HARDWEAR — Streamlit catalogue and workshop accounts.
-Configure credentials in Streamlit Secrets; never hard-code database credentials.
-Creates separate rachna_* tables in the configured PostgreSQL database and does not modify the existing tiffin table.
-"""
+APP_DESCRIPTION = "RACHNA PLAYWOOD & HARDWEAR — Streamlit catalogue and workshop accounts."
 import io, os, hmac, base64, html, hashlib, smtplib, ssl, json, mimetypes, secrets
 from datetime import date, timedelta, datetime
 import streamlit as st
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
 from PIL import Image
 import requests
 from reportlab.lib.pagesizes import A4
@@ -36,7 +33,7 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif}
 h1,h2,h3,h4{font-family:'Cormorant Garamond',serif!important;color:#d6ae52!important;text-align:center}
 .brand-title{font-family:'Cormorant Garamond',serif;font-size:clamp(2rem,5vw,4rem);font-weight:700;letter-spacing:.04em;color:#d6ae52;text-align:center}
 .brand-sub{letter-spacing:.24em;text-transform:uppercase;color:#d6ae52;font-size:.75rem;text-align:center}
-.hero{padding:1.4rem;border-radius:22px;background:linear-gradient(120deg,#071b33,#102c50);color:white;border:1px solid #d6ae52;text-align:center}
+.hero{margin-bottom:18px;padding:1.4rem;border-radius:22px;background:linear-gradient(120deg,#071b33,#102c50);color:white;border:1px solid #d6ae52;text-align:center}
 .hero h2{color:#d6ae52!important;font-size:2.4rem}.hero p{color:#f5ead2;text-align:center}
 div[data-testid="stMetric"]{background:#102c50;border:1px solid #d6ae52;padding:14px;border-radius:15px}
 section[data-testid="stSidebar"]{background:#071b33!important;z-index:100000!important}
@@ -48,9 +45,9 @@ button[kind="headerNoPadding"]{visibility:visible!important}
 .product-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
 .product-mini{min-width:0;border:1px solid #d6ae524d;border-radius:14px;padding:8px;background:#071b33cc;overflow:hidden}
 .product-mini img{width:100%;height:var(--product-h,150px);object-fit:contain;background:#fff;border-radius:10px;display:block}
-.product-mini .name{font-weight:800;color:#f7f0df;font-size:.95rem;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.product-mini .price{color:#d6ae52;font-weight:800;font-size:.9rem}
-.product-mini .cat{color:#aab6c5;font-size:.72rem}
+.product-mini .name{font-weight:800;color:#ffffff!important;font-size:.95rem;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.product-mini .price{color:#22c55e!important;font-weight:900;font-size:.95rem}
+.product-mini .cat{color:#dbe4ef!important;font-size:.72rem}
 .product-dots{color:#d6ae52;text-align:center;font-size:.9rem;letter-spacing:3px;margin-top:3px}
 .profile-card{border:1px solid #d6ae52;border-radius:22px;padding:20px;background:#071b33dd;text-align:center}
 .dp{width:92px;height:92px;border-radius:50%;object-fit:cover;border:3px solid #d6ae52;margin:auto;display:block}
@@ -88,16 +85,30 @@ def db_connect():
     if missing: raise RuntimeError("Missing Streamlit Secrets: "+", ".join(missing))
     return psycopg2.connect(host=cfg("DB_HOST"),dbname=cfg("DB_NAME"),user=cfg("DB_USER"),
         password=cfg("DB_PASSWORD"),port=int(cfg("DB_PORT")),sslmode=cfg("DB_SSLMODE","require"),
-        connect_timeout=8,cursor_factory=RealDictCursor)
+        connect_timeout=5,cursor_factory=RealDictCursor)
+
+@st.cache_resource(show_spinner=False)
+def db_pool():
+    keys=["DB_HOST","DB_NAME","DB_USER","DB_PASSWORD","DB_PORT"]
+    missing=[k for k in keys if not cfg(k)]
+    if missing: raise RuntimeError("Missing Streamlit Secrets: "+", ".join(missing))
+    return ThreadedConnectionPool(
+        1, 5,
+        host=cfg("DB_HOST"), dbname=cfg("DB_NAME"), user=cfg("DB_USER"),
+        password=cfg("DB_PASSWORD"), port=int(cfg("DB_PORT")),
+        sslmode=cfg("DB_SSLMODE","require"), connect_timeout=5,
+        cursor_factory=RealDictCursor,
+    )
 
 def query(sql, params=None, fetch=True):
-    conn=db_connect()
+    pool=db_pool(); conn=pool.getconn()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(sql,params or ())
                 return cur.fetchall() if fetch and cur.description else cur.rowcount
-    finally: conn.close()
+    finally:
+        pool.putconn(conn)
 
 def init_db():
     sqls=[
@@ -226,6 +237,7 @@ def login_bootstrap_cached():
     try:
         with conn.cursor() as cur:
             cur.execute("""CREATE TABLE IF NOT EXISTS rachna_users(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,phone TEXT NOT NULL UNIQUE,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL DEFAULT '',is_admin BOOLEAN NOT NULL DEFAULT FALSE,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+            cur.execute("CREATE TABLE IF NOT EXISTS rachna_site_settings(setting_key TEXT PRIMARY KEY,image_data BYTEA,image_url TEXT,mime_type TEXT,text_value TEXT,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
             for sql in [
                 "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE",
                 "ALTER TABLE rachna_users ADD COLUMN IF NOT EXISTS otp_hash TEXT",
@@ -376,7 +388,14 @@ def password_ok(user_id, entered):
     return hmac.compare_digest(str(user_id), str(aid)) and hmac.compare_digest(str(entered), str(apw))
 
 
-PAGE_NAMES = ["Home", "Gallery", "Order", "Account", "Order History", "Order Details", "Track Order", "Master Gallery", "Master Account", "About", "Contact Us", "Login", "Admin Master"]
+PAGE_NAMES = [
+    "Login", "Home", "Categories", "Featured", "Offers", "New Arrivals", "Gallery",
+    "Category Page", "Product Details", "Search Results", "Your Bag", "Order", "Card Payment",
+    "Track Order", "Order History", "Wishlist", "Account", "Notifications", "Help Center",
+    "About", "Contact Us", "Admin Dashboard", "Order Details", "Emails", "Master Gallery",
+    "Manage Categories", "Customers", "Offers Admin", "Inventory", "Sales Reports", "Reviews",
+    "Master Account", "Admin Master"
+]
 SETTING_KEYS = {
     "App logo": "app_logo",
     **{f"{page} background": f"bg_{page.lower().replace(' ', '_')}" for page in PAGE_NAMES},
@@ -678,11 +697,15 @@ def site_admin_page():
         if st.button('Save logo',type='primary',key='save_admin_logo') and upload_lock('lock_save_admin_logo'):
             try: save_image_setting('app_logo',logo); release_upload_lock('lock_save_admin_logo'); st.rerun()
             except Exception as e: release_upload_lock('lock_save_admin_logo'); st.error(str(e))
-        for page in ['Home','Gallery','Order','Account','About','Contact Us']:
-            key=f'bg_{page.lower().replace(" ","_")}'; up=st.file_uploader(f'{page} background',type=['png','jpg','jpeg','webp'],key=f'upload_{key}')
-            if st.button(f'Save {page} background',key=f'save_{key}') and upload_lock(f'lock_{key}'):
-                try: save_image_setting(key,up); release_upload_lock(f'lock_{key}'); st.rerun()
-                except Exception as e: release_upload_lock(f'lock_{key}'); st.error(str(e))
+        st.caption('All customer, login/sign-in and admin pages are available below. Select a page, upload its background, and save. This keeps Admin Settings fast.')
+        bg_page=st.selectbox('Choose page background',PAGE_NAMES,key='bg_page_selector')
+        bg_key=f'bg_{bg_page.lower().replace(" ","_")}'
+        current=get_setting(bg_key)
+        if current and image_row_source(current): st.image(image_row_source(current),caption=f'Current {bg_page} background',width=220)
+        up=st.file_uploader(f'Choose {bg_page} background',type=['png','jpg','jpeg','webp'],key=f'upload_{bg_key}')
+        if st.button(f'Save {bg_page} background',key=f'save_{bg_key}') and upload_lock(f'lock_{bg_key}'):
+            try: save_image_setting(bg_key,up); release_upload_lock(f'lock_{bg_key}'); st.rerun()
+            except Exception as e: release_upload_lock(f'lock_{bg_key}'); st.error(str(e))
     st.subheader('About page — marquee images')
     uploads=st.file_uploader('Add any number of logos/images',type=['png','jpg','jpeg','webp'],accept_multiple_files=True,key='marquee_uploads')
     if st.button('Save About marquee images',key='save_marquee_images') and upload_lock('lock_save_marquee_images'):
@@ -702,7 +725,7 @@ def site_admin_page():
     if save:
         save_text_setting('product_image_width',w); save_text_setting('product_image_height',h); save_text_setting('product_image_height_mobile',hm); st.success('Product image display size saved.'); st.rerun()
     st.subheader('Page access / public visibility')
-    public_pages=['Home','Categories','Featured','Offers','New Arrivals','Gallery','Category Page','Product Details','Search Results','Your Bag','Order','Track Order','Order History','Wishlist','Account','Notifications','Help Center','About','Contact Us']
+    public_pages=['Home','Categories','Featured','Offers','New Arrivals','Gallery','Category Page','Product Details','Search Results','Your Bag','Order','Card Payment','Track Order','Order History','Wishlist','Account','Notifications','Help Center','About','Contact Us']
     for pg in public_pages: query('INSERT INTO rachna_page_config(page_name,visible) VALUES(%s,TRUE) ON CONFLICT(page_name) DO NOTHING',(pg,),fetch=False)
     page_rows=query('SELECT page_name,visible FROM rachna_page_config WHERE page_name=ANY(%s) ORDER BY page_name',(public_pages,))
     with st.form('page_visibility_form'):
@@ -710,6 +733,24 @@ def site_admin_page():
     if save_pages:
         for pg,val in visibility.items(): query('UPDATE rachna_page_config SET visible=%s WHERE page_name=%s',(val,pg),fetch=False)
         public_page_names.clear(); page_is_visible.clear(); st.rerun()
+    st.subheader('Contact Us settings')
+    cs=contact_settings()
+    with st.form('contact_settings_form'):
+        c1,c2=st.columns(2)
+        instagram=c1.text_input('Instagram',cs.get('contact_instagram',''),placeholder='https://instagram.com/...')
+        whatsapp=c2.text_input('WhatsApp',cs.get('contact_whatsapp',''),placeholder='https://wa.me/91...')
+        c3,c4=st.columns(2)
+        youtube=c3.text_input('YouTube',cs.get('contact_youtube',''),placeholder='https://youtube.com/...')
+        email=c4.text_input('Email',cs.get('contact_email',''))
+        c5,c6=st.columns(2)
+        phone1=c5.text_input('Contact 1',cs.get('contact_phone1',''))
+        phone2=c6.text_input('Contact 2',cs.get('contact_phone2',''))
+        address=st.text_area('Address',cs.get('contact_address',''))
+        save_contact=st.form_submit_button('Save Contact settings',type='primary')
+    if save_contact:
+        for k,v in [('contact_instagram',instagram),('contact_whatsapp',whatsapp),('contact_youtube',youtube),('contact_email',email),('contact_phone1',phone1),('contact_phone2',phone2),('contact_address',address)]: save_contact_setting(k,v.strip())
+        st.success('Contact settings saved.'); st.rerun()
+
     st.subheader('Global theme colors')
     with st.form('theme_color_form'):
         bg=st.color_picker('Background color',theme_settings().get('theme_bg','#071b33')); card=st.color_picker('Card / panel color',theme_settings().get('theme_card','#102c50')); accent=st.color_picker('Golden heading/text color',theme_settings().get('theme_accent','#d6ae52')); btn=st.color_picker('Button color',theme_settings().get('theme_btn','#ff4b4b')); save_theme=st.form_submit_button('Save theme colors')
@@ -770,6 +811,19 @@ def page_is_visible(page_name):
 def text_setting(key, default=""):
     rows=query("SELECT text_value FROM rachna_site_settings WHERE setting_key=%s",(key,))
     return str(rows[0]["text_value"] or default) if rows else default
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def contact_settings():
+    keys=["contact_instagram","contact_whatsapp","contact_youtube","contact_email","contact_phone1","contact_phone2","contact_address"]
+    rows=query("SELECT setting_key,text_value FROM rachna_site_settings WHERE setting_key=ANY(%s)",(keys,))
+    out={k:"" for k in keys}
+    for r in rows: out[str(r["setting_key"])]=str(r.get("text_value") or "")
+    return out
+
+def save_contact_setting(key,value):
+    save_text_setting(key,value)
+    contact_settings.clear()
 
 
 def save_text_setting(key, value):
@@ -970,12 +1024,13 @@ def send_order_email(order, debug=False, event_title="Order Confirmation", send=
         try: order['tracking_token']=ensure_tracking_token(order.get('id'))
         except Exception as te: log(f'Tracking token warning: {type(te).__name__}: {te}')
     live_track=tracking_url(order)
-    track_block=(f'<div style="margin:18px 0;padding:16px;background:#071b33;border-radius:14px;text-align:center;border:1px solid #d6ae52"><div style="color:#d6ae52;font-size:12px;font-weight:800;letter-spacing:1.5px;margin-bottom:8px">LIVE ORDER TRACKING</div><a href="{html.escape(live_track,quote=True)}" style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;font-weight:800;padding:13px 22px;border-radius:10px">VIEW LIVE ORDER STATUS</a><div style="font-size:11px;color:#d7dde6;margin-top:9px">Your original order email stays the same. Open this link anytime to see the latest status.</div><div style="margin-top:8px;font-size:10px;line-height:14px;word-break:break-all"><a href="{html.escape(live_track,quote=True)}" style="color:#d6ae52;text-decoration:underline">{html.escape(live_track)}</a></div></div>' if live_track else '<div style="margin:18px 0;padding:14px;background:#fff3cd;border:1px solid #e0bd55;border-radius:12px;text-align:center;font-size:12px;color:#5b4a16"><b>Live tracking link is not configured.</b><br>Add <b>APP_URL</b> in Streamlit Secrets, then place a new order to receive the link.</div>')
+    track_block=(f'<div style="margin:18px 0;padding:16px;background:#071b33;border-radius:14px;text-align:center;border:1px solid #d6ae52"><div style="color:#d6ae52;font-size:12px;font-weight:800;letter-spacing:1.5px;margin-bottom:10px">LIVE ORDER TRACKING</div><a href="{html.escape(live_track,quote=True)}" style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;font-weight:800;padding:13px 22px;border-radius:10px">VIEW LIVE ORDER STATUS</a><div style="font-size:10px;line-height:14px;word-break:break-all;margin-top:10px"><a href="{html.escape(live_track,quote=True)}" style="color:#d6ae52;text-decoration:underline">Open tracking link</a></div></div>' if live_track else '<div style="margin:18px 0;padding:14px;background:#fff3cd;border:1px solid #e0bd55;border-radius:12px;text-align:center;font-size:12px;color:#5b4a16"><b>Live tracking link is not configured.</b></div>')
+
     customer=html.escape(str(order.get('customer_name') or '')); phone=html.escape(str(order.get('phone') or '')); address=html.escape(str(order.get('address') or '—')); delivery=html.escape(str(order.get('delivery_date') or '')); category=html.escape(str(order.get('category') or '')); product_name=html.escape(str(order.get('product_name') or '')); quantity=html.escape(str(order.get('quantity') or '')); unit_price=html.escape(money(order.get('unit_price'))); total=html.escape(money(order.get('total_price')))
     is_status_update=event_title.lower().startswith('order status')
     notice_title='Order status updated' if is_status_update else 'Order received'
     notice_text=f"Your order status is now <b>{html.escape(str(order.get('order_status') or 'Order Placed'))}</b>." if is_status_update else 'Your order has been successfully placed.'
-    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:800;">{html.escape(email_brand_name())}</div><div style="color:#d6ae52;font-size:12px;letter-spacing:3px;text-transform:uppercase;font-weight:700;margin-top:7px;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;"><div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-weight:800;color:#071b33;margin-bottom:10px;">ORDER TRACKING</div>{tracking_html(str(order.get("order_status") or "Order Placed"))}</div>{track_block}<div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">{notice_title}</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">{notice_text}</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div></td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">{html.escape(email_brand_name())}</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
+    html_body=f'''<!doctype html><html><body style="margin:0;padding:0;background:#f3f0e8;font-family:Arial,Helvetica,sans-serif;color:#172033;"><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f3f0e8;padding:24px 8px;"><tr><td align="center"><table width="620" cellpadding="0" cellspacing="0" role="presentation" style="max-width:620px;width:100%;background:#fff;border-radius:18px;overflow:hidden;"><tr><td style="background:#071b33;padding:28px 22px;text-align:center;border-bottom:4px solid #d6ae52;">{logo_html}<div style="color:#d6ae52;font-size:13px;letter-spacing:3px;text-transform:uppercase;font-weight:800;">{html.escape(email_brand_name())}</div><div style="color:#d6ae52;font-size:12px;letter-spacing:3px;text-transform:uppercase;font-weight:700;margin-top:7px;">{html.escape(event_title.upper())}</div><div style="color:#fff;font-size:24px;font-weight:700;margin-top:8px;">Thank you, {customer}!</div></td></tr><tr><td style="padding:26px 24px;">{track_block}<div style="background:#fffaf0;border:1px solid #ead7a0;border-radius:14px;padding:16px 18px;margin-bottom:18px;"><div style="font-size:12px;color:#8a6a25;text-transform:uppercase;letter-spacing:1px;font-weight:700;">{notice_title}</div><div style="font-size:16px;font-weight:700;color:#071b33;margin-top:5px;">{notice_text}</div></div><table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;"><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Product</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;font-weight:700;">{product_name}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Category</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{category}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Quantity</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{quantity}</td></tr><tr><td style="padding:11px 8px;border-bottom:1px solid #eee;color:#777;">Unit price</td><td align="right" style="padding:11px 8px;border-bottom:1px solid #eee;">{unit_price}</td></tr><tr><td style="padding:14px 8px;color:#071b33;font-size:17px;font-weight:800;">Total</td><td align="right" style="padding:14px 8px;color:#b48618;font-size:20px;font-weight:800;">{total}</td></tr></table><div style="margin-top:14px;padding:14px;background:#fffaf0;border:1px solid #ead7a0;border-radius:12px;"><b>Payment:</b> {html.escape(str(order.get("payment_method") or "COD"))} · {html.escape(str(order.get("payment_status") or "Pending"))}</div><div style="margin-top:20px;padding:16px;background:#f7f7f7;border-radius:12px;"><div style="font-weight:800;color:#071b33;margin-bottom:8px;">Delivery details</div><div style="font-size:14px;line-height:1.7;color:#555;"><b>Phone:</b> {phone}<br><b>Delivery date:</b> {delivery}<br><b>Address:</b> {address}</div></div></td></tr><tr><td style="background:#071b33;padding:18px 20px;text-align:center;color:#d8d8d8;font-size:12px;line-height:1.6;"><b style="color:#d6ae52;">{html.escape(email_brand_name())}</b><br>Crafted for your space · Premium quality</td></tr></table></td></tr></table></body></html>'''
     text_body=(f"RACHNA PLAYWOOD & HARDWEAR - {event_title}\n\nThank you, {order.get('customer_name') or ''}!\n\nCurrent status: {order.get('order_status') or 'Order Placed'}\n\nProduct: {order.get('product_name') or ''}\nCategory: {order.get('category') or ''}\nQuantity: {order.get('quantity') or ''}\nUnit price: {money(order.get('unit_price'))}\nTotal: {money(order.get('total_price'))}\n\nPhone: {order.get('phone') or ''}\nDelivery date: {order.get('delivery_date') or ''}\nAddress: {order.get('address') or ''}\n\nLive tracking: {live_track or 'Set APP_URL in Streamlit Secrets to enable it.'}\n")
     email_msg=EmailMessage(); email_msg['Subject']=f"Rachna Order #{order.get('order_number') or order.get('id') or ''} — {event_title}"; email_msg['From']=f'{from_name} <{user}>'; email_msg['To']=customer_email
     if admin_email and admin_email.lower()!=customer_email.lower(): email_msg['Cc']=admin_email
@@ -1149,7 +1204,6 @@ def products(active=True):
     return query(f"""SELECT p.* FROM rachna_products p {where} ORDER BY p.created_at DESC""")
 
 @st.cache_data(ttl=120, show_spinner=False)
-@st.cache_data(ttl=120, show_spinner=False)
 def images_for_products(product_ids):
     ids=tuple(int(x) for x in product_ids if x is not None)
     if not ids: return {}
@@ -1200,7 +1254,7 @@ def auto_product_card(product, ims, width, height, mobile_height=None):
     mobile_height=mobile_height or max(70,height-20)
     name=html.escape(str(product.get("title") or "")); cat=html.escape(str(product.get("category") or "")); price=html.escape(money(product.get("price")))
     dots="" if len(imgs)<=1 else "·"*len(imgs)
-    card=f"""<style>@media(max-width:720px){{#pc_{product['id']} img{{height:{mobile_height}px!important}}}}</style><div class='product-mini' style='--product-h:{height}px;--product-w:{width}%;--product-h-mobile:{mobile_height}px'><div id='pc_{product['id']}' style='width:var(--product-w);margin:0 auto'><img loading='lazy' src='{imgs[0]}' style='width:100%;height:var(--product-h);object-fit:contain;background:#fff;border-radius:10px;display:block'></div><div class='product-dots'>{dots}</div><div class='name'>{name}</div><div class='price'>{price}</div><div class='cat'>{cat}</div></div>"""
+    card=f"""<style>@media(max-width:720px){{#pc_{product['id']} img{{height:{mobile_height}px!important}}}}</style><div class='product-mini' style='--product-h:{height}px;--product-w:{width}%;--product-h-mobile:{mobile_height}px'><div id='pc_{product['id']}' style='width:var(--product-w);margin:0 auto'><img loading='lazy' src='{imgs[0]}' style='width:100%;height:var(--product-h);object-fit:contain;background:#fff;border-radius:10px;display:block'></div><div class='product-dots'>{dots}</div><div class='name' style='color:#ffffff!important;font-weight:800'>{name}</div><div class='price' style='color:#22c55e!important;font-weight:900'>{price}</div><div class='cat' style='color:#dbe4ef!important'>{cat}</div></div>"""
     script="""<script>(function(){const imgs=__IMGS__;let i=0;const root=document.getElementById('pc_ID');if(!root||imgs.length<2)return;setInterval(()=>{i=(i+1)%imgs.length;root.innerHTML='<img src=\"'+imgs[i]+'\" style=\"width:100%;height:100%;object-fit:contain;background:#fff;border-radius:10px;display:block\">'},1000)})();</script>""".replace('__IMGS__',safe_imgs).replace('ID',str(product['id']))
     import streamlit.components.v1 as components
     components.html(card+script,height=max(height,mobile_height)+78,scrolling=False)
@@ -1536,23 +1590,56 @@ def your_bag_page():
     total=bag_total(); st.markdown(f"<div class='hero'><h2>₹{total:,.2f}</h2><p>{len(st.session_state.bag)} products · one combined order</p></div>",unsafe_allow_html=True)
     if st.button('Proceed to Checkout',type='primary',use_container_width=True): st.session_state.page='Order'; st.rerun()
 
+def card_payment_page():
+    page_header('PAYMENT','Card Payment','Card entry preview — card number and CVV are never stored. Real charging requires a payment gateway.')
+    user=current_user()
+    if not user: st.info('Please login first.'); return
+    init_cart(); items=bag_items(); total=bag_total()
+    if not items: st.info('Your Bag is empty.'); return
+    st.markdown(f"""<div style="max-width:430px;margin:0 auto 18px;padding:22px;border-radius:22px;background:linear-gradient(135deg,#182848,#4b6cb7);color:#fff;box-shadow:0 14px 35px rgba(0,0,0,.28);font-family:Arial,sans-serif"><div style="font-size:13px;letter-spacing:2px;opacity:.85">RACHNA CARD PAYMENT</div><div style="font-size:25px;font-weight:800;margin-top:28px;letter-spacing:3px">•••• •••• •••• ••••</div><div style="display:flex;justify-content:space-between;margin-top:22px;font-size:12px"><span>CARD HOLDER</span><span>VALID THRU</span></div><div style="display:flex;justify-content:space-between;margin-top:4px;font-weight:700"><span>{html.escape(str(user.get('name') or 'CARD HOLDER')).upper()}</span><span>MM / YY</span></div><div style="text-align:right;font-size:28px;margin-top:8px">💳</div></div>""",unsafe_allow_html=True)
+    st.markdown(f'<div class="hero"><h3>Amount ₹{total:,.2f}</h3><p>Credit / Debit Card</p></div>',unsafe_allow_html=True)
+    with st.form('card_payment_form'):
+        number=st.text_input('Card Number',placeholder='1234 5678 9012 3456',max_chars=19)
+        holder=st.text_input('Card Holder Name',value=str(user.get('name') or ''))
+        c1,c2=st.columns(2)
+        expiry=c1.text_input('Expiry (MM/YY)',placeholder='MM/YY',max_chars=5)
+        cvv=c2.text_input('CVV',type='password',max_chars=4,placeholder='•••')
+        pay=st.form_submit_button(f'Pay ₹{total:,.2f}',type='primary',use_container_width=True)
+    if pay:
+        digits=''.join(ch for ch in number if ch.isdigit())
+        if len(digits) not in (15,16) or len(cvv)<3 or len(holder.strip())<2 or len(expiry.strip())!=5:
+            st.error('Enter valid card details.'); return
+        st.session_state.card_payment_verified=True
+        st.session_state.selected_payment_method='Credit / Debit Card'
+        st.success('Card details accepted for checkout. No card number or CVV is stored by the app.')
+        st.session_state.page='Order'; st.rerun()
+
+
 def order_page():
-    page_header('NEW ORDER','New Order','Checkout your Your Bag')
-    user=current_user();
+    page_header('NEW ORDER','Checkout','Review your bag and complete delivery/payment.')
+    user=current_user()
     if not user: st.warning('Please login first.'); return
     init_cart(); items=bag_items()
-    if not items: st.info('Your Bag is empty. Add products from Collections first.'); return
+    if not items: st.info('Your Bag is empty. Add products from Products first.'); return
     total=bag_total()
     for x in items: st.write(f"**{x['title']}** × {x['quantity']:g} — ₹{x['price']*x['quantity']:,.2f}")
+    methods=['COD','UPI','Credit / Debit Card','Online Payment']
+    current=st.session_state.get('selected_payment_method','COD'); selected=st.radio('Payment method',methods,index=methods.index(current) if current in methods else 0,horizontal=True)
+    st.session_state.selected_payment_method=selected
+    if selected=='Credit / Debit Card' and not st.session_state.get('card_payment_verified'):
+        st.info('Credit / Debit Card selected. Continue to the card form.')
+        if st.button('💳 Continue to Card Payment',type='primary',use_container_width=True): _go('Card Payment')
+        return
+    if selected=='Credit / Debit Card': st.success('Card form completed. Your card details are not stored by this app.')
     with st.form('order_form'):
-        name=st.text_input('Customer name',value=user['name']); phone=st.text_input('Phone',value=user['phone']); address=st.text_area('Delivery address',value=user.get('address') or ''); delivery=st.date_input('Delivery date',value=date.today()+timedelta(days=2),min_value=date.today()+timedelta(days=2)); payment=st.radio('Payment method',['COD','UPI','Credit / Debit Card','Online Payment'],horizontal=True); submit=st.form_submit_button(f'Place Order · ₹{total:,.2f}',type='primary',use_container_width=True)
+        name=st.text_input('Customer name',value=user['name']); phone=st.text_input('Phone',value=user['phone']); address=st.text_area('Delivery address',value=user.get('address') or ''); delivery=st.date_input('Delivery date',value=date.today()+timedelta(days=2),min_value=date.today()+timedelta(days=2)); submit=st.form_submit_button(f'Place Order · ₹{total:,.2f}',type='primary',use_container_width=True)
     if submit:
         if not name.strip() or not phone.strip() or not address.strip(): st.error('Name, phone and delivery address are required.'); return
         ensure_orders_table(); no='RCH'+datetime.now().strftime('%Y%m%d%H%M%S')+str(user['id']).zfill(3); token=secrets.token_urlsafe(24); first=items[0]
-        row=query('''INSERT INTO rachna_orders(user_id,customer_name,phone,address,delivery_date,product_id,category,product_name,quantity,unit_price,total_price,order_number,customer_email,payment_method,payment_status,order_status,updated_at,tracking_token) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s) RETURNING *''',(user['id'],name.strip(),phone.strip(),address.strip(),delivery,first['product_id'],first.get('category'),first['title'],first['quantity'],first['price'],total,no,str(user.get('email') or '').strip(),payment,'Pending','Order Placed',token))[0]
+        row=query("""INSERT INTO rachna_orders(user_id,customer_name,phone,address,delivery_date,product_id,category,product_name,quantity,unit_price,total_price,order_number,customer_email,payment_method,payment_status,order_status,updated_at,tracking_token) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s) RETURNING *""",(user['id'],name.strip(),phone.strip(),address.strip(),delivery,first['product_id'],first.get('category'),first['title'],first['quantity'],first['price'],total,no,str(user.get('email') or '').strip(),selected,'Pending','Order Placed',token))[0]
         for x in items: query('INSERT INTO rachna_order_items(order_id,product_id,product_name,category,quantity,unit_price,line_total) VALUES(%s,%s,%s,%s,%s,%s,%s)',(row['id'],x['product_id'],x['title'],x.get('category'),x['quantity'],x['price'],float(x['price'])*float(x['quantity'])),fetch=False)
         query('INSERT INTO rachna_order_status_history(order_id,status,note) VALUES(%s,%s,%s)',(row['id'],'Order Placed','Order created by customer'),fetch=False)
-        ok,msg=send_order_email(dict(row),event_title='Order Placed'); st.session_state.bag={}; st.success(f"Order #{no} placed successfully. "+('Confirmation + invoice sent to your email.' if ok else ''))
+        ok,msg=send_order_email(dict(row),event_title='Order Placed'); st.session_state.bag={}; st.session_state.card_payment_verified=False; st.session_state.selected_payment_method='COD'; st.success(f"Order #{no} placed successfully. "+('Confirmation + invoice sent to your email.' if ok else ''))
         if not ok: st.warning('Email failed: '+msg)
         st.download_button('⬇ Download Invoice PDF',data=build_invoice_pdf(dict(row)),file_name=f'Rachna_Invoice_{no}.pdf',mime='application/pdf',key=f'newpdf_{row["id"]}')
 
@@ -1600,12 +1687,37 @@ def notifications_page():
     for r in rows:
         st.markdown(f"<div class='profile-card' style='text-align:left;margin-bottom:8px'><b>#{html.escape(str(r.get("order_number") or ""))}</b><br><span style='color:#d6ae52;font-weight:800'>{html.escape(str(r.get("status") or ""))}</span><br>{html.escape(str(r.get("note") or "Status updated"))}<br><small style='color:#94a3b8'>{html.escape(str(r.get("changed_at") or ""))}</small></div>",unsafe_allow_html=True)
 
+@st.cache_data(ttl=30, show_spinner=False)
+def active_offers():
+    return query("SELECT title,code,discount_value,discount_type FROM rachna_offers WHERE active=TRUE ORDER BY created_at DESC LIMIT 3")
+
+
 def help_page():
-    page_header('HELP & SUPPORT','Help Center','Quick answers for orders, accounts and products.')
-    faqs=[('How do I order?','Open Products, add items to My Bag, then open Checkout and place one combined order.'),('How do I track an order?','Open Track Order, or use the live tracking link from your order email.'),('Can I order multiple products together?','Yes. Add multiple products to My Bag and checkout once.'),('How can I change my account details?','Open My Account after signing in.'),('Why does my old email still show the old status?','Delivered Gmail messages cannot be edited. Use the live tracking link in the original order email.') ]
+    page_header('HELP & SUPPORT','Help Center','Quick answers and direct support.')
+    faqs=[('How do I order?','Open Products, add items to My Bag, then open Checkout and place one combined order.'),('How do I track an order?','Open Track Order, or use the live tracking button from your order email.'),('Can I order multiple products together?','Yes. Add multiple products to My Bag and checkout once.'),('How can I change my account details?','Open My Account after signing in.'),('Why does my old email still show the old status?','Delivered Gmail messages cannot be edited. Use the live tracking link in the original order email.')]
     for q,a in faqs:
         with st.expander(q): st.write(a)
-    st.markdown('<div class="hero"><h3>Need more help?</h3><p>Open Contact Us for support.</p></div>',unsafe_allow_html=True)
+    user=current_user() if st.session_state.get('user_id') else None
+    st.subheader('Contact Support')
+    if not user:
+        st.info('Please sign in to send support from your account email.')
+        return
+    with st.form('help_support_form'):
+        name=st.text_input('Name',value=str(user.get('name') or ''))
+        contact=st.text_input('Contact',value=str(user.get('phone') or ''))
+        email=st.text_input('Email',value=str(user.get('email') or ''),disabled=True)
+        description=st.text_area('Description',placeholder='Describe your issue or question...',height=180)
+        send=st.form_submit_button('Send to Rachna Support',type='primary',use_container_width=True)
+    if send:
+        if not name.strip() or not contact.strip() or not description.strip():
+            st.error('Name, contact and description are required.'); return
+        support_to=str(cfg('ADMIN_EMAIL') or cfg('SMTP_USER') or '').strip()
+        if not support_to:
+            st.error('Support email is not configured in Streamlit Secrets.'); return
+        details=f"Customer support request\n\nName: {name.strip()}\nContact: {contact.strip()}\nEmail: {email.strip()}\n\nDescription:\n{description.strip()}"
+        ok,msg=send_generic_email(support_to,f'Rachna Support — {name.strip()}',details,'Customer Support')
+        if ok: st.success('Support request sent successfully.')
+        else: st.error(msg)
 
 def _go(page, **state):
     for k,v in state.items(): st.session_state[k]=v
@@ -1831,6 +1943,8 @@ def main():
     except Exception as e:
         st.error('PostgreSQL connection or table setup failed.'); st.code(str(e)); st.stop()
     if 'wishlist' not in st.session_state: st.session_state.wishlist=set()
+    if 'card_payment_verified' not in st.session_state: st.session_state.card_payment_verified=False
+    if 'selected_payment_method' not in st.session_state: st.session_state.selected_payment_method='COD'
     if track_q:
         st.session_state.page='Track Order'
     # Sidebar visibility is controlled by Streamlit's native, accessible hamburger toggle.
@@ -1839,7 +1953,7 @@ def main():
         icon=(f"<img src='{html.escape(dp,quote=True)}' style='width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #d6ae52'>" if dp else "<div style='width:44px;height:44px;border-radius:50%;background:#071b33;border:2px solid #d6ae52;display:flex;align-items:center;justify-content:center;font-size:22px'>👤</div>")
         st.markdown(f"<a href='?page=Account' title='Open profile' style='position:fixed;top:.55rem;right:.75rem;z-index:999999;text-decoration:none'>{icon}</a>",unsafe_allow_html=True)
     qp=st.query_params.get('page')
-    valid_pages={'Home','Categories','Featured','Offers','New Arrivals','Gallery','Category Page','Product Details','Search Results','Your Bag','Order','Track Order','Order History','Wishlist','Account','Notifications','Help Center','About','Contact Us','Order Details','Emails','Master Gallery','Master Account','Admin Master','Admin Dashboard','Manage Categories','Customers','Offers Admin','Inventory','Sales Reports','Reviews','Login'}
+    valid_pages={'Home','Categories','Featured','Offers','New Arrivals','Gallery','Category Page','Product Details','Search Results','Your Bag','Order','Card Payment','Track Order','Order History','Wishlist','Account','Notifications','Help Center','About','Contact Us','Order Details','Emails','Master Gallery','Master Account','Admin Master','Admin Dashboard','Manage Categories','Customers','Offers Admin','Inventory','Sales Reports','Reviews','Login'}
     # Consume a page deep-link only once. Previously ?page=Account stayed in
     # the browser URL, so every sidebar click was immediately forced back to
     # Account on the next Streamlit rerun.
@@ -1856,19 +1970,8 @@ def main():
         # Two-level sidebar navigation:
         # 1) User navigation is always first for admins as well.
         # 2) Admin-only navigation appears below it and is never shown to normal users.
-        # Admin sees the COMPLETE customer navigation first, then every admin module.
-        # Normal users see only the customer navigation.
-        user_nav=[
-            'Home','Categories','Featured','Offers','New Arrivals',
-            'Gallery','Category Page','Product Details','Search Results',
-            'Your Bag','Order','Track Order','Order History','Wishlist',
-            'Account','Notifications','Help Center','About','Contact Us'
-        ]
-        admin_nav=[
-            'Admin Dashboard','Order Details','Master Gallery','Manage Categories',
-            'Customers','Offers Admin','Inventory','Sales Reports','Reviews',
-            'Emails','Master Account','Admin Master'
-        ]
+        user_nav=['Home','Categories','Featured','Offers','New Arrivals','Gallery','Category Page','Product Details','Search Results','Your Bag','Order','Track Order','Notifications','Order History','Wishlist','Account','Help Center','About','Contact Us']
+        admin_nav=['Admin Dashboard','Order Details','Master Gallery','Manage Categories','Customers','Offers Admin','Inventory','Sales Reports','Reviews','Emails','Master Account','Admin Master']
 
         if st.session_state.admin:
             st.markdown('### 👤 User Navigation')
@@ -1906,16 +2009,16 @@ def main():
         st.divider()
         if st.session_state.admin or st.session_state.user_id:
             if st.button('Log out',use_container_width=True):
-                st.session_state.admin=False; st.session_state.user_id=None; st.session_state.page='Login'; st.session_state._consumed_page_qp='Login'; st.rerun()
+                st.session_state.admin=False; st.session_state.user_id=None; st.session_state.page='Login'; st.session_state.card_payment_verified=False; st.session_state._consumed_page_qp='Login'; st.rerun()
         st.caption('Created by MEET MEVADA')
     p=st.session_state.page
     if not st.session_state.admin and p not in ('Login','Track Order') and not st.session_state.user_id:
         p='Login'; st.session_state.page='Login'
-    if not st.session_state.admin and p not in ('Login','Track Order'):
+    if not st.session_state.admin and p not in ('Login','Track Order','Card Payment'):
         try:
             if not page_is_visible(p): st.session_state.page='Home'; p='Home'
         except Exception: pass
-    if needs_full_schema: apply_page_branding(p)
+    apply_page_branding(p)
     if p=='Login': login_page()
     elif p=='Home':
         st.markdown(f'<div class="hero"><div class="brand-sub">CRAFTED FOR YOUR SPACE</div><h2>{APP_NAME}</h2><p>Furniture, plywood and hardware — explore our collection.</p></div>',unsafe_allow_html=True)
@@ -1935,9 +2038,9 @@ def main():
                 with col:
                     if st.button(str(r['name']),key=f'home_cat_{r["name"]}',use_container_width=True): _go('Category Page',selected_category=str(r['name']))
         st.subheader('New Arrivals')
-        _render_product_list(products()[:4],'home_new')
+        _render_product_list(items[:4],'home_new')
         st.subheader('Offers / Deals')
-        active_offers=query("SELECT title,code,discount_value,discount_type FROM rachna_offers WHERE active=TRUE ORDER BY created_at DESC LIMIT 3")
+        active_offers=active_offers()
         if active_offers:
             st.write(' · '.join(f"{r['title']} ({r['code'] or 'Deal'})" for r in active_offers))
         if st.button('View all offers',key='home_offers'): _go('Offers')
@@ -1954,6 +2057,7 @@ def main():
     elif p=='Help Center': help_page()
     elif p=='Master Gallery': gallery(True)
     elif p=='Order': order_page()
+    elif p=='Card Payment': card_payment_page()
     elif p=='Your Bag': your_bag_page()
     elif p=='Order History': user_order_history()
     elif p=='Track Order': user_track_order_page() if st.session_state.user_id else public_track_page()
@@ -1988,7 +2092,17 @@ def main():
         st.markdown(f'''<div style=\"display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:18px 0\"><div class=\"hero\"><div style=\"font-size:28px;font-weight:900\" data-count=\"{customer_count}\">+0</div><div>Customers</div></div><div class=\"hero\"><div style=\"font-size:28px;font-weight:900\" data-count=\"{product_count}\">+0</div><div>Products</div></div><div class=\"hero\"><div style=\"font-size:28px;font-weight:900\" data-count=\"{company_count}\">+0</div><div>Company Products Available</div></div></div><script>document.querySelectorAll('[data-count]').forEach(el=>{{let n=Number(el.dataset.count),i=0,step=Math.max(1,Math.ceil(n/45));let t=setInterval(()=>{{i=Math.min(n,i+step);el.textContent='+'+i.toLocaleString('en-IN');if(i>=n)clearInterval(t)}},22)}})</script>''',unsafe_allow_html=True)
         a,b,c=st.columns(3); a.markdown('### 🪵 Furniture\nMade-to-order furniture.'); b.markdown('### 🧰 Hardware\nFittings and hardware products.'); c.markdown('### 📐 Materials\nPlywood, sizes and colours.')
     elif p=='Contact Us':
-        page_header('GET IN TOUCH','Get In Touch','Contact details will be added when provided.'); st.markdown('<div class="hero"><h2>We would love to hear from you.</h2><p>Contact information coming soon.</p></div>',unsafe_allow_html=True)
+        page_header('GET IN TOUCH','Contact Us','Reach Rachna through the channels configured by Admin.')
+        cs=contact_settings(); cards=[]
+        if cs.get('contact_instagram'): cards.append(f'<a href="{html.escape(cs["contact_instagram"],quote=True)}" target="_blank">📸 Instagram</a>')
+        if cs.get('contact_whatsapp'): cards.append(f'<a href="{html.escape(cs["contact_whatsapp"],quote=True)}" target="_blank">💬 WhatsApp</a>')
+        if cs.get('contact_youtube'): cards.append(f'<a href="{html.escape(cs["contact_youtube"],quote=True)}" target="_blank">▶ YouTube</a>')
+        if cs.get('contact_email'): cards.append(f'<a href="mailto:{html.escape(cs["contact_email"],quote=True)}">✉ Email: {html.escape(cs["contact_email"])}</a>')
+        if cs.get('contact_phone1'): cards.append(f'<div>☎ Contact 1: {html.escape(cs["contact_phone1"])}</div>')
+        if cs.get('contact_phone2'): cards.append(f'<div>☎ Contact 2: {html.escape(cs["contact_phone2"])}</div>')
+        if cs.get('contact_address'): cards.append(f'<div>📍 {html.escape(cs["contact_address"])}</div>')
+        body=''.join(f'<div style="padding:12px 0;border-bottom:1px solid #d6ae5233">{x}</div>' for x in cards) or '<p>Contact details are being updated by Rachna.</p>'
+        st.markdown(f'<div class="hero" style="text-align:left"><h2 style="text-align:center">We would love to hear from you.</h2>{body}</div>',unsafe_allow_html=True)
 
 # st.markdown('<div style="margin-top:2rem;padding:1rem 0;border-top:1px solid #d6ae5255;text-align:center;color:#aab6c5;font-size:.8rem">© RACHNA PLAYWOO &amp; HARDWEAR · All rights reserved</div>', unsafe_allow_html=True)
 
